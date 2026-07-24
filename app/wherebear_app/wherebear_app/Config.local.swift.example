@@ -1,0 +1,13 @@
+// Config.local.swift.example — 範本（committed）。
+// fresh checkout：copy 成 Config.local.swift 再填值 —— `cp Config.local.swift.example Config.local.swift`
+// 本尊 Config.local.swift 是 gitignored（不進 repo）；prod anon key＝專案專屬機密。
+//   取值＝Supabase Dashboard → Settings → API → anon public（或 `supabase projects api-keys` 取 id=anon）。
+//   synchronized group 會自動編譯 Config.local.swift。詳 docs/DEPLOYMENT.md §4。
+import Foundation
+
+enum Secrets {
+    static let prodAnonKey = "<你的 prod anon public key>"
+    static let prodURL = "https://<你的 supabase 專案 ref>.supabase.co"
+    // dev 端點＝你 mac 的 Bonjour 名（`<你的機器名>.local:54321`）；跟機器走、mDNS 被擋就改成 LAN IP（如 `http://192.168.x.x:54321`）。
+    static let devURL = "http://your-mac.local:54321"
+}

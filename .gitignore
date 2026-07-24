@@ -1,0 +1,39 @@
+# ── 秘密 / 私域（born-clean：這些永不入 git）──
+.env
+.env.*
+!.env.example
+CLAUDE.local.md
+secrets/
+*.secret
+
+# ── Supabase 本地 ──
+supabase/.branches/
+supabase/.temp/
+.supabase/
+
+# ── iOS / Xcode ──
+app/**/Config.local.swift
+!app/**/Config.local.swift.example
+app/**/xcuserdata/
+app/**/*.xcuserstate
+app/**/DerivedData/
+build/
+
+# ── bridge（Python）──
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# ── Edge Functions（Deno/Node）──
+node_modules/
+
+# ── bridge 產出的本地位置檔（真資料、不入庫）──
+*.local.json
+bridge/out/
+
+# ── macOS ──
+.DS_Store
+
+# 私房 splash 氛圍詞庫（personal、不入公庫；public 用 Taglines.json sample）
+Taglines.local.json

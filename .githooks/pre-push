@@ -1,0 +1,16 @@
+#!/usr/bin/env bash
+# born-clean 守門：push 前用 gitleaks 掃秘密，偵測到就擋下 push。
+# 啟用：git config core.hooksPath .githooks
+set -uo pipefail
+
+if ! command -v gitleaks >/dev/null 2>&1; then
+  echo "✗ gitleaks 未安裝 —— push 已擋（born-clean 不裸推）。裝：brew install gitleaks" >&2
+  exit 1
+fi
+
+if ! gitleaks git --no-banner --redact .; then
+  echo "✗ gitleaks 偵測到疑似秘密 —— push 已擋。修掉（或用 .gitleaksignore 白名單誤報）再推。" >&2
+  exit 1
+fi
+
+echo "✓ gitleaks 無洩漏，放行 push。"
