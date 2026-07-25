@@ -23,14 +23,23 @@ struct StayRow: View {
             }
             .frame(width: 26)
             VStack(alignment: .leading, spacing: 2) {
-                HStack(alignment: .firstTextBaseline) {
+                HStack(alignment: .firstTextBaseline, spacing: 8) {
                     Text(stay.name)
                         .font(.system(size: 15.5, weight: .bold))
                         .foregroundStyle(BearTheme.cream)
-                    Spacer()
+                        .lineLimit(2)
+                        .truncationMode(.tail)
+                    Spacer(minLength: 0)
+                    // 時間欄固定寬：進行中的停留只有起始時間（"21:07"）、已結束的有區間
+                    // （"21:07 – 21:38"），寬度不同會讓左邊的名字拿到不一樣的空間 →
+                    // **同一個長別名在兩列斷在不同位置**。固定寬度後每一列的名字欄一樣寬、斷行一致。
+                    // 寬度取「已結束」那種格式在 12pt 下的實測寬度並留一點餘裕。
                     Text(timeRangeText)
                         .font(.system(size: 12))
                         .foregroundStyle(BearTheme.cream.opacity(0.5))
+                        .lineLimit(1)
+                        .fixedSize()
+                        .frame(width: 84, alignment: .trailing)
                 }
                 HStack(spacing: 8) {
                     Text(detailText)

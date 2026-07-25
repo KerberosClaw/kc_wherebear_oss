@@ -99,7 +99,7 @@ app 用 Supabase client SDK 打 PostgREST；下列每個操作 RLS 以 `auth.uid
 
 ## 2. B 平面 — Headless 讀口（Edge Functions）
 
-只有兩支，皆 **read-only**、皆 `verify_jwt=off`（不吃 GoTrue JWT，吃 API key）。
+三支（兩支讀取 ＋ 一支換發），皆 `verify_jwt=off`（不吃 GoTrue JWT，吃 API key）。
 
 **通用請求 header**：
 ```
@@ -148,6 +148,25 @@ Edge Function：取 header key → `sha256` → 查 `api_keys` where `key_hash=`
 - **多日（app 端）**：app JWT 平面 RPC —— `my_stays_days(p_days date[], p_tz)`（**任意多天、可不連續**，行事曆多選用、上限 31 天）＋ `my_stays_range(p_from, p_to, p_tz)`（連續區間、上限 32 天）。回 `[{day, name, from, to, dwell, centroid_lat, centroid_lng, confidence, source}]`（同 stay 形狀＋`day` 欄）、`auth.uid()` scope。單日仍用 `my_today_stays(p_day, p_tz)`（回 `{name, from, to, dwell, centroid_lat, centroid_lng, confidence, source}`）。（headless 讀口 `/today-stays` 目前仍單日；下游要範圍再另議。）
 - **`source`（app 平面三口專有，migration 11、D14 擴充）**：`"live"`＝實時回報聚出的**停留段**；`"visit"`＝`CLVisit` 靜止停留（時間邊界較準，位置／名稱已與重疊的 live 段合併）；`"photo_import"`＝相簿匯入的**個別點**（`to=null`、`dwell=0`、`confidence=1`）。app 端據此在時間軸／地圖以相機 icon 標匯入點、其餘顯示編號。
 - **headless `/today-stays`（D14 起）**：改吃 `stays_for_day`（`visit` ＋ `live` 合併），**仍濾掉 `photo_import`** → 下游只吃「面」不變、回應形狀不變（無 `source` 欄）。改前只吃 `detect_stays`，久坐不動的長停留在下游會縮成碎片（實測一段 11 小時 32 分的停留，下游只看到 11 分）。
+
+### 2.3 `POST /realtime-token`（D13 事件通道換發口）
+
+把自家的 `wb_` key 翻譯成 Realtime 認得的短效 token。**唯一會回傳憑證的端點**。
+
+```jsonc
+// 200 OK
+{
+  "token": "<JWT，HS256，role=anon + wb_uid claim>",
+  "topic": "wb:events:<user_id>",             // 順便回，訂閱端因此不需要知道自己的 user_id
+  "expires_at": "2026-01-01T12:30:00.000Z",
+  "ttl_s": 1800
+}
+// 無 key / 無效 key / 已撤銷 → 401（同 §5）
+// 伺服器未設 WB_JWT_SECRET → 500（大聲壞掉，不默默發一張沒人認得的 token）
+```
+
+- 🔴 這張 token **權限刻意一無所有**：`role=anon` 在 `public` schema 無任何表權限；身分靠 `wb_uid` claim，由 `realtime.messages` 的 RLS policy 綁 topic。拿它打 PostgREST 一律 `permission denied`。
+- 消費端**只存在記憶體、不落檔**，到期前自行重換。
 
 ---
 
@@ -227,6 +246,37 @@ bridge daemon 拉 §2 兩讀口 → **atomic 寫**一份本地 JSON；下游（�
 - `schema_version` 供未來相容演進；破壞性改動 bump 版本 + 更新本契約。
 
 ---
+
+## 6.5 事件通道（D13 · 到達／離開）
+
+### 6.5.1 broadcast payload
+
+私有頻道 `wb:events:<user_id>`、event 名 `visit`。由資料庫觸發器產生，**只有落在使用者 `landmarks` 半徑內才發**。
+
+```jsonc
+{
+  "schema_version": 1,
+  "kind": "arrival" | "departure",
+  "name": "<landmarks alias>",                // 🔴 只有名字，不含原始座標
+  "visit_id": 123,
+  "arrived_at": "2026-01-01T09:00:00+08:00",
+  "departed_at": "2026-01-01T18:00:00+08:00", // arrival 時為 null
+  "dwell_s": 32400                            // arrival 時為 null（那時還算不出來）
+}
+```
+
+### 6.5.2 事件檔（下游消費契約）
+
+event bridge 把收到的事件 append 成**每日一檔** `events_YYYYMMDD.jsonl`（當地日期），一行一則，內容＝上面的 payload 外加：
+
+```jsonc
+{ "received_at": "2026-01-01T09:00:12.345Z", ...payload }
+```
+
+- **`received_at` 只用來排序與記水位，不可拿來判新鮮度** —— 離線佇列補傳會在數小時後才把舊的到達寫進資料庫，那時 `received_at` 是「剛剛」。判新鮮度要看 `arrived_at` / `departed_at`。
+- 寫入者只有 event bridge 一個，讀取端只 append-only 地往後讀。
+- 同地點同類型的重複事件在 bridge 端已先合併（見 `TUNABLES.md`）。
+- 破壞性改動 bump `schema_version`；消費端對不上的版本應視為不認識、跳過。
 
 ## 7. 範圍界線
 
