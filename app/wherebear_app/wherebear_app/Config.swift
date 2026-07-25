@@ -3,7 +3,9 @@
 // 切換：env 預設 = prod；只有帶 `DEV` 編譯旗標的 build 才切 dev。正常 ⌘R = prod、免 Release/上架。
 //
 // born-clean 註：dev 值＝私有 LAN + supabase 本地「公開 demo anon key」（全球一致、非機密、committed）。
-// prod anon key＝專案專屬機密 → 不進 repo，住 gitignored 的 Config.local.swift（Secrets.prodAnonKey）。
+// prod 端點與 anon key 都不進 repo，住 gitignored 的 Config.local.swift（Secrets.prodURL / prodAnonKey）。
+// 專案 ref 嚴格說不是秘密（它是 API 子網域、也編在 app 二進位檔裡，擋人的是 RLS 與認證），
+// 但沒理由把它白送出去——知道 ref 才能針對性地打（試登入、耗 rate limit、盯 RLS 有沒有被改鬆）。
 import Foundation
 
 enum AppEnv { case dev, prod }
@@ -23,7 +25,7 @@ enum Config {
     static var supabaseURL: URL {
         switch env {
         case .dev:  return URL(string: Secrets.devURL)!          // dev 端點＝你的 mac Bonjour 名（<name>.local:54321），住 gitignored Config.local.swift（mDNS 被擋就在那改成 LAN IP）
-        case .prod: return URL(string: Secrets.prodURL)!          // prod 端點＝你的 Supabase 專案（住 gitignored Config.local.swift）
+        case .prod: return URL(string: Secrets.prodURL)!         // prod 端點＝你的 Supabase 專案（住 gitignored Config.local.swift）
         }
     }
 
