@@ -37,3 +37,6 @@ bridge/out/
 
 # 私房 splash 氛圍詞庫（personal、不入公庫；public 用 Taglines.json sample）
 Taglines.local.json
+
+# ── born-clean 掃描的站點字詞（永不入 git）──
+.bornclean-deny

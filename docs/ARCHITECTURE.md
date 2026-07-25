@@ -1,6 +1,6 @@
 # ARCHITECTURE — kc_wherebear 系統架構
 
-> **English summary:** A whole-system engineering overview of kc_wherebear — how a native iOS SwiftUI app reports location to a self-hosted Supabase backend, how a local bridge layer turns that into local files, and how a downstream consumer reads those files with no outbound calls of its own. Data reaches the consumer by two independent paths: a polled snapshot, and a pushed event stream for arrivals at / departures from user-named places (emitted by a database trigger, delivered over a private Realtime broadcast, and consumed by a long-running listener). It walks through the system diagram, the data model (split into three function-scoped ER diagrams), both end-to-end flows, the iOS app's layered architecture, and the deployment topology — seven mermaid diagrams in all. Interface values are not duplicated here — the contract lives in `API_CONTRACT.md`.
+> **English summary:** A whole-system engineering overview of kc_wherebear — how a native iOS SwiftUI app reports location to a self-hosted Supabase backend, how a local bridge layer turns that into local files, and how a downstream consumer reads those files with no outbound calls of its own. Data reaches the consumer by two independent paths: a polled snapshot, and a pushed event stream for arrivals at / departures from user-named places (emitted by a database trigger, delivered over a private Realtime broadcast, and consumed by a long-running listener). It walks through the system diagram, the data model (split into three function-scoped ER diagrams), the end-to-end flows (write path, snapshot read path, and the two-part event path), the iOS app's layered architecture, and the deployment topology — nine mermaid diagrams in all. Interface values are not duplicated here — the contract lives in `API_CONTRACT.md`.
 
 > 全景工程文件：**手機回報位置 → 自架 Supabase → 本地 bridge → 下游消費者**的一條龍。
 > 這份給「想快速看懂整個系統長怎樣」的人；**介面細節不在這** —— 契約看 [`API_CONTRACT.md`](API_CONTRACT.md)（SSOT）、設計理由看 [`DESIGN.md`](DESIGN.md) / [`DESIGN_app.md`](DESIGN_app.md)、可調參數看 [`TUNABLES.md`](TUNABLES.md)。這份只畫「元件怎麼接、資料怎麼流」，不複製契約值。
@@ -212,91 +212,126 @@ erDiagram
 
 ## 3. 端到端資料流
 
-資料到下游有**兩條獨立的路**，並行、不互相取代：
+一趟完整的路分三段畫（每張只放該段真正參與的角色，圖才讀得動）：
 
-| | 3.1 快照（輪詢） | 3.2 事件（推播） |
+| 段 | 誰跟誰 | 回答的問題 |
 |---|---|---|
-| 回答的問題 | 「他現在在哪、今天去過哪」 | 「他**剛剛**到了／離開了某個命名地點」 |
-| 觸發 | bridge 定時拉 | 資料庫觸發器發 broadcast |
-| 落地 | 覆寫式快照 JSON | 每日 append 的事件檔 |
-| 下游怎麼吃 | 自己的節奏讀最新狀態 | 被叫醒來讀 |
+| **3.1 寫入** | 手機 → 後端 | 位置怎麼進到資料庫 |
+| **3.2 快照讀取** | 後端 → bridge → 下游 | 「他現在在哪、今天去過哪」 |
+| **3.3 事件推播** | 資料庫 → listener → 下游 | 「他**剛剛**到了／離開了某個命名地點」（再拆 3.3a 建訂閱 / 3.3b 事件流）|
 
-### 3.1 快照路徑（輪詢）
+3.2 與 3.3 是**兩條獨立的路**，並行、不互相取代：一條是下游自己按節奏讀最新狀態，一條是事件來了把下游叫醒。
 
-省電設計：手機**低頻**回報、後端聚類成「面」、bridge 週期性快取成本地檔。
+### 3.1 寫入路徑（手機 → 後端）
+
+省電設計：手機**低頻**回報，靜止也寫（那是停留偵測的原料）。
 
 ```mermaid
 sequenceDiagram
     autonumber
     participant P as 📱 App
-    participant R as PostgREST (A)
+    participant R as PostgREST (A 平面)
     participant DB as Postgres
     participant CR as pg_cron
-    participant B as bridge (B)
+
+    Note over P: 前景 poll (標準 60s / 省電 180s)<br/>背景 significant-change (~500m) + CLVisit
+    P->>R: upsert current_location + insert location_history (JWT)
+    R->>DB: RLS auth.uid() 綁定寫入
+    DB->>DB: 觸發器：反證式修剪<br/>(當前位置在別處 → 關掉還開著的停留)
+
+    Note over P: 停留事件
+    P->>R: upsert visits (到達=INSERT / 離開=UPDATE departed_at)
+    R->>DB: 唯一鍵 (user_id, arrived_at)、不含座標
+    DB->>DB: 觸發器：新到達自動關閉先前未關的停留
+
+    P-->>P: 離線 → outbox 佇列；回前景 flush 補送
+    Note over CR,DB: 每日排程
+    CR->>DB: 30 天前 location_history → archive (搬不是刪)
+```
+
+> 兩個觸發器都是為了同一件事：**停留段一定要關得掉**。CLVisit 的離開投遞會遺失、也會對短距離移動不發新到達（`DESIGN D15`）。
+
+### 3.2 快照讀取路徑（後端 → 下游）
+
+下游永遠只讀本地檔；網路只發生在 bridge 那一格。
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant B as bridge (B 平面)
     participant EF as Edge Function
+    participant DB as Postgres
     participant J as 本地 JSON
     participant AG as 下游消費者
 
-    Note over P: 前景 poll(60/180s·靜止也寫)<br/>背景 significant-change + CLVisit
-    P->>R: upsert current_location + insert location_history (JWT)
-    R->>DB: RLS auth.uid() 綁定寫入
-    P-->>P: 離線→outbox；回前景 flush 補送
-
-    Note over CR,DB: 週期
-    CR->>DB: 30 天前 location_history → archive (move-not-delete)
-
-    Note over B: 每 poll 週期 (300s，prod 建議 600)
+    Note over B: 每 poll 週期 (預設 300s，prod 建議 600)
     B->>EF: GET /last-location + /today-stays<br/>x-wb-key: wb_xxxx
     EF->>DB: resolve_api_key(key) → user_id
-    EF->>DB: WHERE user_id=解析出的<br/>current_location / stays_for_day / resolve_name
-    DB-->>EF: R1 當前位置(resolved_name) + R2 今天停留段
+    EF->>DB: WHERE user_id = 解析出的<br/>current_location / stays_for_day / resolve_name
+    DB-->>EF: 當前位置 (resolved_name) + 今天的停留段
     EF-->>B: 200 JSON (raw lat/lng 保留)
-    B->>J: atomic write (temp+rename)<br/>meta/current/today (schema_version=1)
-    Note over J: 抓不到→current=null，不 crash
+    B->>J: atomic write (temp + rename)<br/>meta / current / today
+    Note over J: 抓不到 → current=null，不 crash
 
-    Note over AG: 下游判斷週期
+    Note over AG: 下游自己的節奏
     AG->>J: read only (零外呼)
-    AG-->>AG: 用 resolved_name + 時間 + 新鮮度<br/>(不碰 raw 座標) 組脈絡 → 產出訊息
+    AG-->>AG: 用 resolved_name + 時間 + 新鮮度<br/>(不碰 raw 座標) 組脈絡
 ```
 
 **新鮮度 / hedge**（`API_CONTRACT §6`）：下游用 `meta.fetched_at`（bridge 抓取時間）+ `current.captured_at`（裝置取得時間）各自判過時、對舊資料措辭保守；`current=null` = bridge 這輪抓不到，下游不當「人在 null-island」。`schema_version` 供未來相容演進。
 
 **地名解析**（`API_CONTRACT §3`）：座標 → 名稱固定優先序 **① 使用者 alias（落 landmark radius 內）② `geocode_cache` 快取地名 ③ 通用 reverse-geocode（`geocode` Edge Function → Nominatim，read-through 存快取）④ null**。命中 alias/快取就免打外部 API。快取鍵＝座標四捨五入 4 位（app/function/SQL 一致）。
 
-### 3.2 事件路徑（推播）
+> 🔴 改 `_shared/` 底下的地名邏輯要**重新部署所有引用它的 function** —— Edge Function 在部署當下才打包 `_shared`。而且 `geocode_cache` 不會自己更新，改標籤格式要一併清舊快取。
 
-只有**到達／離開使用者自己命名過的地點**才會產生事件；未命名的地方完全靜默。
+### 3.3 事件推播路徑（資料庫 → listener → 下游）
+
+只有**到達／離開使用者自己命名過的地點**才會產生事件；未命名的地方完全靜默。分兩張：先把訂閱建起來，再看事件怎麼流。
+
+#### 3.3a 建立訂閱（listener 怎麼取得身分）
 
 ```mermaid
 sequenceDiagram
     autonumber
-    participant P as 📱 App
+    participant EB as event bridge
+    participant EF as realtime-token
     participant DB as Postgres
     participant RT as Realtime
-    participant EF as realtime-token
+
+    Note over EB: 啟動時，以及 token 到期前 60 秒
+    EB->>EF: POST /realtime-token (x-wb-key)
+    EF->>DB: resolve_api_key(key) → user_id
+    EF-->>EB: {token (role=anon + wb_uid claim), topic, ttl}
+    EB->>RT: 訂閱 topic wb:events:{uid} (private)
+    RT->>DB: 查 realtime.messages 的 RLS
+    Note over RT,DB: policy：topic 必須等於<br/>'wb:events:' + jwt 的 wb_uid
+    RT-->>EB: SUBSCRIBED
+```
+
+**為什麼要換發**：`wb_` key 是自家發明的，只有自家 Edge Function 認得；Realtime 是平台服務、只認 JWT。這一步就是那道翻譯。
+
+**為什麼這張 token 幾乎什麼都不能做**（`DESIGN D13`）：`role=anon` 是**權限等級**（該角色在 `public` schema 一無所有），`wb_uid` 是**身分標籤**（policy 拿它綁 topic）。兩者拆開，才做得到「能收自己的事件、除此之外什麼都不能做」。若改成訂閱 `visits` 表，就需要一把看得見該表的 JWT，而同一把對 PostgREST 一樣有效 → 消費端權限會膨脹成整個帳號。
+
+#### 3.3b 事件發生到下游
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant DB as Postgres
+    participant RT as Realtime
     participant EB as event bridge
     participant F as 事件檔 (jsonl)
     participant AG as 下游消費者
 
-    Note over EB: 啟動時 / token 到期前 60s
-    EB->>EF: POST /realtime-token (x-wb-key)
-    EF->>DB: resolve_api_key → user_id
-    EF-->>EB: {token(role=anon + wb_uid), topic, ttl}
-    EB->>RT: 訂閱 wb:events:{uid} (private)
-    RT->>DB: realtime.messages 的 RLS<br/>topic 必須等於 wb:events:{jwt.wb_uid}
-
-    Note over P,DB: 使用者到達或離開
-    P->>DB: visits INSERT（到達）/ UPDATE departed_at（離開）
+    Note over DB: visits 有到達或離開（寫入路徑見 3.1）
     DB->>DB: 觸發器查 landmarks —— 沒命中就到此為止
     DB->>RT: realtime.send(payload, 'visit', topic, private)
-    RT-->>EB: broadcast（名字/kind/時間/dwell，**無座標**）
+    RT-->>EB: broadcast（名字 / kind / 時間 / 停留時長，**無座標**）
     EB->>EB: 同地點同類型 N 秒內合併
     EB->>F: append events_YYYYMMDD.jsonl
-    EB->>AG: clearEnv + 前綴白名單起行程
-    AG->>F: 讀事件（新鮮度看 arrived_at/departed_at，不是收到時間）
+    EB->>AG: 以 clearEnv + 前綴白名單起行程（金鑰不過繼）
+    AG->>F: 讀事件並自行判斷要不要反應
 ```
-
-**為什麼不是訂閱資料表**（`DESIGN D13`）：訂閱 `visits` 需要一把看得見該表的 JWT，而同一把對 PostgREST 一樣有效 → 消費端權限會從「兩支窄讀口」膨脹成整個帳號。改成資料庫端解析後發 broadcast，換發出來的 token 用 `role=anon`（該角色在 `public` 一無所有）＋ `wb_uid` claim 綁 topic，**除了聽自己的事件什麼都做不了**。
 
 **新鮮度陷阱**：離線佇列補傳會把幾小時前的到達寫進資料庫，觸發器照發 —— 所以事件的新鮮度要看 `arrived_at`／`departed_at`，**不能看收到的時間**。
 

@@ -1,0 +1,25 @@
+# born-clean deny-list 範本 —— 複製成 .bornclean-deny（已 gitignore）後填站點專屬內容。
+#
+# 🔴 這份範本只放佔位；**真實的字詞永遠不進 git**——它們本身就是要防的東西。
+#
+# 兩種行：
+#   <regex>           要抓的字詞（大小寫敏感）
+#   skip:<路徑或前綴>  私有限定、刻意含操作真值、不掃也絕不鏡像到公開版的檔案／目錄
+#
+# `#` 開頭是註解。
+#
+# 建議涵蓋的 regex：
+#   真名 / 化名 / persona 名稱
+#   具體機器名 / 主機名 / VPN 主機
+#   雲端專案 ref、Apple Team ID、bundle id
+#   自己常去的地點名、行政區名
+#   下游私有專案的名稱與其環境變數前綴
+#
+# 範例（換成你自己的）：
+# 王小明
+# 某某熊
+# my-mac-mini
+# abcdefghijklmnopqrst
+# skip:CLAUDE.local.md
+# skip:docs/PRIVATE_NOTES.md
+# skip:specs/

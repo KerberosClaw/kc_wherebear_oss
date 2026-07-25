@@ -26,7 +26,11 @@ bridge/     膠水：本地 daemon 拉 Supabase 讀取口 → 寫本地 JSON（�
 
 - **零秘密進 git**：token / key / 真實座標一律不進 repo，只 commit `.example`。`service_role` 永不落地 client，只在 Supabase function secrets。
 - config 驅動：路徑 / 端點全走 env 或 placeholder，不硬編。
-- 建議啟用 gitleaks pre-push hook（`.githooks/pre-push`）：`git config core.hooksPath .githooks`（需 `brew install gitleaks`）。
+- 建議啟用 pre-push 三關（`.githooks/pre-push`，任一關紅就擋）：① `gitleaks` 掃秘密 ② `scripts/bornclean_scan.py` 掃身分（真名／機器／絕對家目錄路徑／座標／站點字詞）③ 有改到 `.md` 才跑的文件 lint（`scripts/docs_lint.py`：mermaid 真的渲染 + 相對連結指得到）。
+  啟用：`git config core.hooksPath .githooks`（需 `brew install gitleaks`；mermaid 檢查需 `npm i -g @mermaid-js/mermaid-cli`，沒裝會跳過並提示）。
+  - 站點專屬字詞住 **gitignored 的 `.bornclean-deny`**（範本 `.bornclean-deny.example`）—— 那些字本身就是要防的東西，不能寫進 repo。
+  - 誤報就在該行加 `bornclean:allow` 並寫明理由（行內標記而非集中忽略清單：清單會累積、沒人回頭審）。
+  - 🔴 掃描器每次先跑 `--selftest` 才算數 —— 「零命中」可能是真的乾淨，也可能是它自己壞了。
 
 ## 本機 dev 啟動 SOP
 
