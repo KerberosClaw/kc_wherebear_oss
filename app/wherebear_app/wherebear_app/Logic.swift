@@ -112,6 +112,7 @@ final class LocationDelegate: NSObject, CLLocationManagerDelegate {
     @ObservationIgnored private let outboxCap = 1000          // 上限、避免無限成長
     @ObservationIgnored private let visitOutboxKey = "wb_visit_outbox"  // 離線/連不到期間累積的 CLVisit 停留；回線補送（原本 try? 會靜默丟）
     @ObservationIgnored private let visitOutboxCap = 500
+    @ObservationIgnored private let reportingKey = "wb_reporting"       // 回報開關要跨啟動記住（見 init 的自動恢復）
 
     init() {
         if UserDefaults.standard.string(forKey: "wb_frequency") == "standard" { frequency = .standard }
@@ -152,6 +153,12 @@ final class LocationDelegate: NSObject, CLLocationManagerDelegate {
         delegate.onVisit = { [weak self] v in
             Task { @MainActor in await self?.recordVisit(v) }
         }
+        // 🔴 冷啟動自動恢復回報：significant-change 與 CLVisit 的監控只在 start() 裡註冊，
+        // 而 start() 原本唯一的入口是熊掌按鈕、開關狀態又沒存下來 → 任何一次冷啟動（被系統
+        // 記憶體壓力 kill 後重開、或 iOS 為了定位事件在背景把 app 叫起來）都會變成「監控沒
+        // 註冊」：那次事件收不到，而且之後 iOS 也不會再叫它。實測 2026-07-25 有數段數小時的
+        // 空白正是這個形狀。開關存進 UserDefaults、啟動時照著恢復，這條路才接得起來。
+        if UserDefaults.standard.bool(forKey: reportingKey) { start() }
     }
 
     // 只在「已授權」時取一次新位置 —— 未授權就呼叫 requestLocation 會出事（#1 crash 根因）
@@ -163,6 +170,7 @@ final class LocationDelegate: NSObject, CLLocationManagerDelegate {
 
     func start() {
         isReporting = true
+        UserDefaults.standard.set(true, forKey: reportingKey)   // 見 init：冷啟動要自動恢復，不能只活在按鈕上
         if manager.authorizationStatus == .notDetermined { manager.requestWhenInUseAuthorization() }
         configureBackgroundUpdates()
         manager.startMonitoringSignificantLocationChanges()  // 背景/終止後 iOS 仍可喚醒送點（需 Always + 背景能力）
@@ -185,6 +193,7 @@ final class LocationDelegate: NSObject, CLLocationManagerDelegate {
     }
     func stop() {
         isReporting = false
+        UserDefaults.standard.set(false, forKey: reportingKey)
         manager.stopMonitoringSignificantLocationChanges()
         manager.stopMonitoringVisits()
         pollTask?.cancel(); pollTask = nil

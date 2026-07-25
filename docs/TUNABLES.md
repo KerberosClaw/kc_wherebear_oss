@@ -41,10 +41,44 @@ app 走 `my_today_stays` / `my_stays_range` / `my_stays_days`，皆用上述**�
 |---|---|
 | `WHEREBEAR_POLL_SECONDS` | 300（5 分）；**prod 建議 600（10 分）**——下游消費者間隔更長、5 分過密 |
 
+## 停留段收尾（D15；`supabase/migrations/*_visits_autoclose_stale.sql` ／ `*_departure_evidence_adaptive_threshold.sql`）
+
+| 參數 | 現值 | 說明 |
+|---|---|---|
+| 反證寬限 `gap_min` | 15 分 | 走開多久才算真的離開（**防誤關主要靠這條**，不是距離） |
+| 距離門檻地板 | 120 公尺 | |
+| 地標加成 | 該地標半徑 ＋ 50 公尺 | 公園之類半徑大的地方要真的走出去 |
+| 誤差加成 | 停留誤差 ＋ 當前定位誤差 ＋ 100 公尺 | 兩邊定位都爛時自動放寬 |
+
+實際門檻＝三者取大。🔴 **不要改回寫死常數**：第一版寫死 250 公尺，剛好擋不住當初要修的 209 公尺實例。
+
+## event bridge（`bridge/wherebear_event_bridge.ts`，env 設定）
+
+| 參數 | 現值 | 說明 |
+|---|---|---|
+| `WHEREBEAR_EVENT_COALESCE_S` | 120 | 同地點同類型事件在幾秒內只算一次（CLVisit 會抖、一天也可能進出同一處多次） |
+| `WHEREBEAR_EVENT_JUDGE_TIMEOUT_S` | 300 | 下游處理程式單次執行逾時 |
+| `WB_REALTIME_TOKEN_TTL_S`（function secret） | 1800 | 短效 token 存活秒數；listener 在到期前 60 秒自行重換 |
+
+重連退避是 1s 起、每次加倍、上限 300s；連續失敗 5 次發一次 🟡（**不停止重試**——這一格壞掉不該讓下游陪葬）。
+
+> 下游事件下游處理程式自己的節流（新鮮度、同地點冷卻、每日額度、最小間隔）**不在本 repo** —— 那些屬消費端邏輯，住消費端自己的 config。
+
+## 停留段收尾（D15；`supabase/migrations/*_visits_autoclose_stale.sql` ／ `*_departure_evidence_adaptive_threshold.sql`）
+
+| 參數 | 現值 | 說明 |
+|---|---|---|
+| 反證寬限 `gap_min` | 15 分 | 走開多久才算真的離開（**防誤關主要靠這條**，不是距離） |
+| 距離門檻地板 | 120 公尺 | |
+| 地標加成 | 該地標半徑 ＋ 50 公尺 | 公園之類半徑大的地方要真的走出去 |
+| 誤差加成 | 停留誤差 ＋ 當前定位誤差 ＋ 100 公尺 | 兩邊定位都爛時自動放寬 |
+
+實際門檻＝三者取大。🔴 **不要改回寫死常數**：第一版寫死 250 公尺，剛好擋不住當初要修的 209 公尺實例。
+
 ## 地名快取 `geocode_cache`
 
 | 參數 | 現值 |
 |---|---|
 | 座標 round 精度（快取鍵） | ~11 公尺（四捨五入） |
 
-> 下游消費端（本 repo 之外）另有自己的新鮮度門檻，其參數住該消費者自己的 config，不在本 repo。
+> 下游消費端（本 repo 之外）另有自己的新鮮度與節流門檻，住該消費者自己的 config，不在本 repo。
