@@ -83,7 +83,8 @@ struct SettingsScreen: View {
 
                     section("除錯") {
                         NavigationLink { OutboxDebugScreen() } label: {
-                            row("離線佇列", trailing: "\(reporter.outboxCount) 筆", chevron: true)
+                            // 兩個佇列各自顯示：停留卡住時位置點那格可能是 0、只看一個數字會漏
+                            row("離線佇列", trailing: "地點 \(reporter.outboxCount) · 停留 \(reporter.visitOutboxCount)", chevron: true)
                         }
                         .buttonStyle(.plain)
                     }
@@ -252,34 +253,74 @@ struct SettingsScreen: View {
     }
 }
 
-// 離線佇列除錯（唯讀窺看：回線會自動補送，這裡只看目前積了哪些點）。走 navigation push（非 modal）。
+// 離線佇列除錯（唯讀窺看：回線會自動補送，這裡只看目前積了哪些）。走 navigation push（非 modal）。
+// 兩個佇列分頁顯示 —— 不做兩層 push（除錯頁多半兩邊都 0、多點一次才知道沒事）、
+// 也不放同一頁兩段（位置點上限 1000 筆會把停留埋在下面，而停留才是有價值的那個）。
 private struct OutboxDebugScreen: View {
     @Environment(LocationReporter.self) private var reporter
-    @State private var items: [(lat: Double, lng: Double, at: String)] = []
+    @State private var tab = 0
+    @State private var points: [(lat: Double, lng: Double, at: String)] = []
+    @State private var visits: [(arrived: String, departed: String?, lat: Double, lng: Double)] = []
 
     var body: some View {
-        List {
-            if items.isEmpty {
-                Text("佇列是空的 — 沒有待補送的離線點。")
-                    .font(.system(size: 14)).foregroundStyle(BearTheme.cream.opacity(0.5))
-                    .listRowBackground(BearTheme.surface)
-            } else {
-                ForEach(Array(items.enumerated()), id: \.offset) { _, p in
-                    VStack(alignment: .leading, spacing: 2) {
-                        Text(String(format: "%.5f, %.5f", p.lat, p.lng))
-                            .font(.system(size: 14, weight: .semibold)).foregroundStyle(BearTheme.cream)
-                        Text(p.at).font(.system(size: 11)).foregroundStyle(BearTheme.cream.opacity(0.5))
-                    }
-                    .listRowBackground(BearTheme.surface)
+        VStack(spacing: 0) {
+            DateChips(items: ["地點 (\(points.count))", "停留 (\(visits.count))"], selected: $tab)
+                .padding(.top, 8).padding(.bottom, 12)
+            List {
+                if tab == 0 { pointRows } else { visitRows }
+            }
+            .scrollContentBackground(.hidden)
+            .refreshable { reload() }   // 下拉刷新：重讀佇列
+        }
+        .background(BearTheme.bg)
+        .navigationTitle("離線佇列（\(points.count + visits.count)）")
+        .navigationBarTitleDisplayMode(.inline)
+        .onAppear { reload() }
+    }
+
+    private func reload() {
+        points = reporter.outboxPeek()
+        visits = reporter.visitOutboxPeek()
+    }
+
+    @ViewBuilder private var pointRows: some View {
+        if points.isEmpty {
+            emptyRow("沒有待補送的位置點。")
+        } else {
+            ForEach(Array(points.enumerated()), id: \.offset) { _, p in
+                VStack(alignment: .leading, spacing: 2) {
+                    Text(String(format: "%.5f, %.5f", p.lat, p.lng))
+                        .font(.system(size: 14, weight: .semibold)).foregroundStyle(BearTheme.cream)
+                    Text(p.at).font(.system(size: 11)).foregroundStyle(BearTheme.cream.opacity(0.5))
                 }
+                .listRowBackground(BearTheme.surface)
             }
         }
-        .scrollContentBackground(.hidden)
-        .background(BearTheme.bg)
-        .navigationTitle("離線佇列（\(items.count)）")
-        .navigationBarTitleDisplayMode(.inline)
-        .onAppear { items = reporter.outboxPeek() }
-        .refreshable { items = reporter.outboxPeek() }   // 下拉刷新：重讀佇列
+    }
+
+    @ViewBuilder private var visitRows: some View {
+        if visits.isEmpty {
+            emptyRow("沒有待補送的停留。")
+        } else {
+            ForEach(Array(visits.enumerated()), id: \.offset) { _, v in
+                VStack(alignment: .leading, spacing: 2) {
+                    Text("到達 \(v.arrived)")
+                        .font(.system(size: 14, weight: .semibold)).foregroundStyle(BearTheme.cream)
+                    // 有離開時間＝這筆是「離開」那次投遞；沒有＝到達那次，還在停留中
+                    Text(v.departed.map { "離開 \($0)" } ?? "離開 — 仍在停留中")
+                        .font(.system(size: 11)).foregroundStyle(BearTheme.cream.opacity(0.5))
+                    Text(String(format: "%.5f, %.5f", v.lat, v.lng))
+                        .font(.system(size: 11)).foregroundStyle(BearTheme.cream.opacity(0.5))
+                }
+                .listRowBackground(BearTheme.surface)
+            }
+        }
+    }
+
+    private func emptyRow(_ text: String) -> some View {
+        Text("佇列是空的 — \(text)")
+            .font(.system(size: 14)).foregroundStyle(BearTheme.cream.opacity(0.5))
+            .listRowBackground(BearTheme.surface)
     }
 }
 

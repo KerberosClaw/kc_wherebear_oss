@@ -118,7 +118,8 @@ final class LocationDelegate: NSObject, CLLocationManagerDelegate {
         manager.delegate = delegate
         manager.desiredAccuracy = (frequency == .saver) ? kCLLocationAccuracyHundredMeters : kCLLocationAccuracyNearestTenMeters
         permissionState = LocationReporter.map(manager.authorizationStatus)
-        outboxCount = loadOutbox().count       // 啟動時同步既有佇列筆數
+        outboxCount = loadOutbox().count            // 啟動時同步既有佇列筆數
+        visitOutboxCount = loadVisitOutbox().count  // 停留佇列同理（app 更新後可能還躺著待補送的停留）
         delegate.onAuth = { [weak self] status in
             Task { @MainActor in
                 guard let self else { return }
@@ -255,12 +256,15 @@ final class LocationDelegate: NSObject, CLLocationManagerDelegate {
     }
 
     // CLVisit → visits 表：到達時 departureDate=distantFuture（departed_at 留 null）；離開時同 arrivalDate 再投遞一次帶 departed_at
-    // → merge-duplicates 依 (user_id,arrived_at,lat,lng) upsert 更新 departed_at。失敗進 visit outbox 補送（durable、不再靜默丟）。
+    // → merge-duplicates 依 (user_id,arrived_at) upsert 更新 departed_at。失敗進 visit outbox 補送（durable、不再靜默丟）。
+    // 🔴 鍵不含座標：iOS 兩次投遞的 coordinate 會漂（實測差 33～205 m），含座標會 INSERT 出關不掉的第二列（見 D14）。
+    // accuracy 一併上傳：那是 CLVisit 自報的誤差，後端拿它放寬 landmark alias 比對半徑。
     private func recordVisit(_ visit: CLVisit) async {
         guard let uid = WBAuth.shared.userId, visit.arrivalDate != .distantPast else { return }
         let iso = ISO8601DateFormatter(); iso.formatOptions = [.withInternetDateTime]
         var body: [String: Any] = ["user_id": uid,
                                    "lat": visit.coordinate.latitude, "lng": visit.coordinate.longitude,
+                                   "accuracy": max(visit.horizontalAccuracy, 0),
                                    "arrived_at": iso.string(from: visit.arrivalDate)]
         if visit.departureDate != .distantFuture { body["departed_at"] = iso.string(from: visit.departureDate) }
         await submitVisit(body)
@@ -279,7 +283,7 @@ final class LocationDelegate: NSObject, CLLocationManagerDelegate {
 
     private func postVisit(_ body: [String: Any]) async throws {
         try await WBClient.rest("POST", table: "visits",
-            query: [URLQueryItem(name: "on_conflict", value: "user_id,arrived_at,lat,lng")],
+            query: [URLQueryItem(name: "on_conflict", value: "user_id,arrived_at")],
             body: body, prefer: "resolution=merge-duplicates")
     }
 
@@ -330,12 +334,12 @@ final class LocationDelegate: NSObject, CLLocationManagerDelegate {
         return arr
     }
     private func saveVisitOutbox(_ arr: [[String: Any]]) {
+        visitOutboxCount = arr.count   // 與位置點佇列同樣走觀察式計數 → 設定列筆數即時刷新
         if arr.isEmpty { UserDefaults.standard.removeObject(forKey: visitOutboxKey); return }
         if let d = try? JSONSerialization.data(withJSONObject: arr) { UserDefaults.standard.set(d, forKey: visitOutboxKey) }
     }
-    private func visitKey(_ b: [String: Any]) -> String {
-        "\(b["arrived_at"] ?? "")|\(b["lat"] ?? "")|\(b["lng"] ?? "")"
-    }
+    // 佇列去重鍵＝到達時刻（與 DB 唯一鍵一致）。含座標的話，同一次停留的到達／離開因座標漂移會各佔一格。
+    private func visitKey(_ b: [String: Any]) -> String { "\(b["arrived_at"] ?? "")" }
     private func enqueueVisit(_ body: [String: Any]) {
         var q = loadVisitOutbox()
         let key = visitKey(body)
@@ -353,8 +357,15 @@ final class LocationDelegate: NSObject, CLLocationManagerDelegate {
         }
         saveVisitOutbox(remaining)
     }
-    // 測試/除錯用：目前 visit 佇列筆數
-    func visitOutboxCount() -> Int { loadVisitOutbox().count }
+    // 除錯用（設定頁「離線佇列 → 停留」）：唯讀窺看目前佇列筆數與內容。
+    // 停留佇列是後加的功能、UI 一直只顯示位置點佇列 → 停留卡住時使用者完全看不見（實測踩過）。
+    private(set) var visitOutboxCount = 0   // 觀察式儲存屬性（同 outboxCount）
+    func visitOutboxPeek() -> [(arrived: String, departed: String?, lat: Double, lng: Double)] {
+        loadVisitOutbox().compactMap { b in
+            guard let la = b["lat"] as? Double, let lo = b["lng"] as? Double else { return nil }
+            return ((b["arrived_at"] as? String) ?? "", b["departed_at"] as? String, la, lo)
+        }
+    }
 
     static func map(_ s: CLAuthorizationStatus) -> PermissionState {
         switch s {
@@ -471,28 +482,12 @@ final class LocationDelegate: NSObject, CLLocationManagerDelegate {
     }
 
     // 設定停留清單 + 觸發未命名點的反向地理編碼（#7）
+    // 停留段的合併（CLVisit 管時間、live 聚合管位置）已移到後端 stays_for_day（D14）→ 這裡收到的就是最終清單。
     private func setStays(_ data: Data) {
         loadGeneration += 1
         let gen = loadGeneration
-        todayStays = Self.dedupeVisits(data.jsonArray.map(Self.makeStay))
+        todayStays = data.jsonArray.map(Self.makeStay)
         Task { await geocodeUnnamed(gen: gen) }
-    }
-
-    // visit 停留（CLVisit，較準）與 detect_stays 聚出的 live 停留 時間重疊+位置<150m → 砍那個 live、留 visit
-    private static func dedupeVisits(_ stays: [Stay]) -> [Stay] {
-        let visits = stays.filter { $0.source == .visit }
-        guard !visits.isEmpty else { return stays }
-        return stays.filter { s in
-            guard s.source == .live, let sc = s.coordinate else { return true }
-            let dup = visits.contains { v in
-                guard let vc = v.coordinate else { return false }
-                let near = CLLocation(latitude: sc.latitude, longitude: sc.longitude)
-                    .distance(from: CLLocation(latitude: vc.latitude, longitude: vc.longitude)) <= 150
-                let overlap = s.from < (v.to ?? .distantFuture) && v.from < (s.to ?? .distantFuture)
-                return near && overlap
-            }
-            return !dup
-        }
     }
 
     // 把「未命名地點」補成地名：走「我們自己」的後端 geocode function（Nominatim），不送蘋果、

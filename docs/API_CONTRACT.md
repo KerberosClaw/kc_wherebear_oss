@@ -146,7 +146,8 @@ Edge Function：取 header key → `sha256` → 查 `api_keys` where `key_hash=`
 ```
 - server 端把 raw 點聚成停留段（stay-point detection；半徑/最短停留/gap 參數 spike 調）；**下游只吃「面」、不碰 raw 點**。
 - **多日（app 端）**：app JWT 平面 RPC —— `my_stays_days(p_days date[], p_tz)`（**任意多天、可不連續**，行事曆多選用、上限 31 天）＋ `my_stays_range(p_from, p_to, p_tz)`（連續區間、上限 32 天）。回 `[{day, name, from, to, dwell, centroid_lat, centroid_lng, confidence, source}]`（同 stay 形狀＋`day` 欄）、`auth.uid()` scope。單日仍用 `my_today_stays(p_day, p_tz)`（回 `{name, from, to, dwell, centroid_lat, centroid_lng, confidence, source}`）。（headless 讀口 `/today-stays` 目前仍單日；下游要範圍再另議。）
-- **`source`（app 平面三口專有，migration 11）**：`"live"`＝實時回報聚出的**停留段**；`"photo_import"`＝相簿匯入的**個別點**（`to=null`、`dwell=0`、`confidence=1`）。app 端據此在時間軸／地圖以相機 icon 標匯入點、其餘顯示編號。detect_stays 只聚 `live` 點 → **headless `/today-stays` 仍只回 live 停留段（不含匯入點）**、下游只吃「面」不變（契約穩定）。
+- **`source`（app 平面三口專有，migration 11、D14 擴充）**：`"live"`＝實時回報聚出的**停留段**；`"visit"`＝`CLVisit` 靜止停留（時間邊界較準，位置／名稱已與重疊的 live 段合併）；`"photo_import"`＝相簿匯入的**個別點**（`to=null`、`dwell=0`、`confidence=1`）。app 端據此在時間軸／地圖以相機 icon 標匯入點、其餘顯示編號。
+- **headless `/today-stays`（D14 起）**：改吃 `stays_for_day`（`visit` ＋ `live` 合併），**仍濾掉 `photo_import`** → 下游只吃「面」不變、回應形狀不變（無 `source` 欄）。改前只吃 `detect_stays`，久坐不動的長停留在下游會縮成碎片（實測一段 11 小時 32 分的停留，下游只看到 11 分）。
 
 ---
 
