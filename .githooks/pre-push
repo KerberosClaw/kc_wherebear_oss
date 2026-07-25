@@ -1,16 +1,55 @@
 #!/usr/bin/env bash
-# born-clean 守門：push 前用 gitleaks 掃秘密，偵測到就擋下 push。
+# born-clean 守門：push 前三關，任一關紅就擋。
+#   1. gitleaks        —— 秘密（token / key / 憑證這類有固定形狀的東西）
+#   2. born-clean 掃描 —— 身分（真名 / 機器 / 絕對家目錄路徑 / 座標 / 站點字詞）
+#   3. 文件 lint       —— 只在有改到 .md 時跑：mermaid 真的渲染得出來 + 相對連結指得到
+#
 # 啟用：git config core.hooksPath .githooks
+#
+# 🔴 每一關都要「證明自己抓得到東西」才算數：born-clean 掃描每次先跑 --selftest。
+#    2026-07-26 踩過兩次假陰性，兩次都安靜地回報「乾淨」：
+#      (a) regex 經 shell 變數傳遞時轉義被吃掉
+#      (b) 跳過清單拿絕對路徑比對 → repo 位在 .claude/worktrees/ 底下時整個被跳過
 set -uo pipefail
+cd "$(git rev-parse --show-toplevel)" || exit 1
 
+# ── 1. gitleaks ──────────────────────────────────────────────────────────────
 if ! command -v gitleaks >/dev/null 2>&1; then
   echo "✗ gitleaks 未安裝 —— push 已擋（born-clean 不裸推）。裝：brew install gitleaks" >&2
   exit 1
 fi
-
 if ! gitleaks git --no-banner --redact .; then
   echo "✗ gitleaks 偵測到疑似秘密 —— push 已擋。修掉（或用 .gitleaksignore 白名單誤報）再推。" >&2
   exit 1
 fi
+echo "✓ gitleaks 無洩漏。"
 
-echo "✓ gitleaks 無洩漏，放行 push。"
+# ── 2. born-clean 身分掃描 ───────────────────────────────────────────────────
+if ! python3 scripts/bornclean_scan.py --selftest >/dev/null 2>&1; then
+  echo "✗ born-clean 掃描器自我測試沒過 —— 它現在說什麼都不能信，push 已擋。" >&2
+  python3 scripts/bornclean_scan.py --selftest >&2
+  exit 1
+fi
+if ! python3 scripts/bornclean_scan.py .; then
+  echo "✗ born-clean 掃描命中 —— push 已擋。真的是誤報就在那行加 bornclean:allow 並寫明理由。" >&2
+  exit 1
+fi
+
+# ── 3. 文件 lint（只在有改到 .md 時）─────────────────────────────────────────
+# 比對「即將推的」與遠端目前的 HEAD；抓不到遠端（首推 / 新 branch）就整份掃。
+remote_head="$(git rev-parse --verify --quiet '@{upstream}' 2>/dev/null || true)"
+if [ -n "$remote_head" ]; then
+  changed_md="$(git diff --name-only "$remote_head" HEAD -- '*.md' | head -1)"
+else
+  changed_md="$(git ls-files '*.md' | head -1)"
+fi
+if [ -n "$changed_md" ]; then
+  if ! python3 scripts/docs_lint.py .; then
+    echo "✗ 文件 lint 未過 —— push 已擋。" >&2
+    exit 1
+  fi
+else
+  echo "✓ 這次沒動到 .md，跳過文件 lint。"
+fi
+
+echo "✓ 三關全過，放行 push。"
