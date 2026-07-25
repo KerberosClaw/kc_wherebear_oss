@@ -151,12 +151,13 @@ erDiagram
 | `resolve_api_key(presented)` | `service_role`（Edge Function） | key sha256 → `user_id` + bump `last_used_at`；未命中/已 revoke → 空 |
 | `detect_stays(user, day, tz, radius=150, min_dwell=600, gap=1800)` | 內部 | 把 `location_history`（**只 `source=live`**）聚成停留段（半徑 150m / 最短停 10 分 / gap 30 分） |
 | `photo_points(user, day, tz)` | 內部 | 相簿匯入點 → 個別點（`to=null`、`dwell=0`、`confidence=1`） |
-| `visits_for_day(user, day, tz)` | 內部 | CLVisit 停留段（背景靜止、detect_stays 抓不到的久坐） |
-| `resolve_name(user, lat, lng)` | 內部 | **alias > `geocode_cache` > null**（owner-scope、不打外部 API） |
-| `my_today_stays / my_stays_range / my_stays_days` | `authenticated`（`auth.uid()`） | app 平面：`detect_stays ∪ photo_points ∪ visits_for_day`，各帶 `name`(resolve_name)+`source`。多日/區間版上限 31/32 天 |
+| `visits_for_day(user, day, tz)` | 內部 | CLVisit 停留段（背景靜止、detect_stays 抓不到的久坐）。與當地日有交集就出、時間夾在當日邊界內（跨午夜在兩天各出一段）|
+| `resolve_name(user, lat, lng[, slack_m])` | 內部 | **alias > `geocode_cache` > null**（owner-scope、不打外部 API）。`slack_m` 把 landmark 半徑放寬該座標自報的誤差（CLVisit 粗座標用）|
+| `stays_for_day(user, day, tz)` | 內部 | **D14 合併**：CLVisit 段（時間為準）× live 聚合段（位置／名稱為準，重疊且 ≤150m 者配對）＋兩邊沒配對到的 ＋ 相簿匯入點 |
+| `my_today_stays / my_stays_range / my_stays_days` | `authenticated`（`auth.uid()`） | app 平面：直接回 `stays_for_day` 的合併結果，各帶 `name`(resolve_name)+`source`。多日/區間版上限 31/32 天 |
 | `my_recorded_days` | `authenticated` | 行事曆用：哪些天有資料 |
 
-> **headless `/today-stays` 只回 live 停留段**（`detect_stays`），不含 photo/visit —— 下游只吃「面」的契約穩定。photo/visit 的 UNION 只在 app 平面三讀口。
+> **headless `/today-stays` 回 `stays_for_day` 的合併結果**（`visit` ＋ `live`），但**濾掉 `photo_import`** —— 下游只吃「面」的契約穩定（D14 前只回 `detect_stays`，久坐長停留在下游會縮成碎片）。
 
 ---
 
@@ -187,7 +188,7 @@ sequenceDiagram
     Note over B: 每 poll 週期 (300s，prod 建議 600)
     B->>EF: GET /last-location + /today-stays<br/>x-wb-key: wb_xxxx
     EF->>DB: resolve_api_key(key) → user_id
-    EF->>DB: WHERE user_id=解析出的<br/>current_location / detect_stays / resolve_name
+    EF->>DB: WHERE user_id=解析出的<br/>current_location / stays_for_day / resolve_name
     DB-->>EF: R1 當前位置(resolved_name) + R2 今天停留段
     EF-->>B: 200 JSON (raw lat/lng 保留)
     B->>J: atomic write (temp+rename)<br/>meta/current/today (schema_version=1)

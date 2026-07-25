@@ -15,6 +15,15 @@
 
 app 走 `my_today_stays` / `my_stays_range` / `my_stays_days`，皆用上述**預設值**。要改：改 migration 的 `default`（需 `create or replace` 重套 dev/prod），或呼叫端顯式傳參。
 
+## 停留段合併 `stays_for_day`（D14；`supabase/migrations/*_visit_arrival_key_and_stay_merge.sql`）
+
+| 參數 | 現值 | 意義 |
+|---|---|---|
+| `p_pair_radius_m` | **150 公尺** | CLVisit 段與 live 聚合段視為「同一段停留」的距離門檻（與 `detect_stays` 的 `p_radius_m` 同值）；配對成功者時間用 CLVisit、位置／名稱用 live 中心 |
+| alias 比對容差 | **CLVisit 自報的 `horizontalAccuracy`** | 僅套在「沒配對到 live 段」的 CLVisit 段（粗座標）；配對到的用 live 中心、容差 0。無魔術常數，舊列 `accuracy` 為 null ⇒ 不放寬 |
+
+> 同一地點時而解出 alias、時而掉回 geocode 路名，多半是 **landmark 自身半徑太小**（實測某個常去地點，連 live 精確中心都會落到 120 公尺外）。先調 `landmarks.radius`，不要動這裡。
+
 ## 回報頻率 `LocationReporter`（`app/wherebear_app/wherebear_app/Logic.swift`）
 
 | 項目 | 現值 |
