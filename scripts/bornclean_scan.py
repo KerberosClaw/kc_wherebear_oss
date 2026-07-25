@@ -11,8 +11,15 @@
    regex、`#` 開頭是註解）；範本見 `.bornclean-deny.example`。
 
 用法：
-    python3 scripts/bornclean_scan.py [路徑]            # 掃工作區
+    python3 scripts/bornclean_scan.py [路徑]            # 掃「git 眼中的內容」（預設）
+    python3 scripts/bornclean_scan.py --worktree [路徑] # 改掃工作目錄的實際檔案
     python3 scripts/bornclean_scan.py --selftest        # 驗掃描器本身抓得到東西
+
+🔴 預設掃 git index 而不是工作目錄：要防的是「進到 repo 的東西」。工作目錄裡有一堆
+   **刻意不進 git** 的真值——.env、Config.local.swift、supabase/.temp/、以及 skip-worktree
+   的本機 pbxproj（簽章與 bundle id）。掃工作目錄的話它們每次都會亮紅燈，hook 變成永遠是紅的、
+   然後人就開始無視它。skip-worktree 尤其要小心：檔案「有被 git 追蹤」，但**磁碟上的內容
+   跟 index 裡的不一樣**，會推上去的是後者。
 
 🔴 為什麼有 --selftest：掃描器回報「零命中」可能是真的乾淨，也可能是它自己壞了
    （2026-07-26 實際踩過：regex 經 shell 變數傳遞時轉義被吃掉，掃出假的零命中）。
@@ -104,11 +111,41 @@ def load_deny(root: pathlib.Path) -> tuple[list[tuple[str, str]], set[str]]:
     return out, skip
 
 
+def git_files(root: pathlib.Path) -> list[tuple[str, str]] | None:
+    """回 [(相對路徑, git index 裡的內容)]；不是 git repo 就回 None。"""
+    import subprocess
+    try:
+        r = subprocess.run(["git", "ls-files", "-z"], cwd=root, capture_output=True, timeout=60)
+        if r.returncode != 0:
+            return None
+        names = [n for n in r.stdout.decode("utf-8", "replace").split("\0") if n]
+    except (OSError, subprocess.SubprocessError):
+        return None
+    out = []
+    for n in names:
+        try:
+            c = subprocess.run(["git", "show", f":{n}"], cwd=root, capture_output=True, timeout=60)
+            if c.returncode != 0:
+                continue
+            out.append((n, c.stdout.decode("utf-8")))
+        except (UnicodeDecodeError, OSError, subprocess.SubprocessError):
+            continue
+    return out
+
+
 def scan(root: pathlib.Path, rules: list[tuple[str, str]],
-         skipped: list | None = None, private_only: set[str] | None = None) -> int:
+         skipped: list | None = None, private_only: set[str] | None = None,
+         worktree: bool = False) -> int:
     hits = 0
     skipped = skipped if skipped is not None else []
     private_only = private_only or set()
+
+    if not worktree:
+        gf = git_files(root)
+        if gf is not None:
+            return _scan_pairs(gf, rules, skipped, private_only)
+        print("  ⚠️  不是 git repo（或 git 不可用）→ 退回掃工作目錄。")
+
     for p in sorted(root.rglob("*")):
         if not p.is_file():
             continue
@@ -140,6 +177,30 @@ def scan(root: pathlib.Path, rules: list[tuple[str, str]],
     return hits
 
 
+def _scan_pairs(pairs, rules, skipped, private_only) -> int:
+    """掃 (路徑, 內容) 對——git index 模式走這裡。"""
+    hits = 0
+    for rp, text in pairs:
+        parts = pathlib.PurePosixPath(rp).parts
+        if any(d in parts for d in SKIP_DIRS):
+            continue
+        if pathlib.PurePosixPath(rp).suffix.lower() in SKIP_SUFFIX or parts[-1] == DENY_FILE:
+            continue
+        if any(rp == sp or rp.startswith(sp.rstrip("/") + "/") for sp in private_only):
+            skipped.append(rp)
+            continue
+        lines = text.splitlines()
+        for label, pat in rules:
+            for m in re.finditer(pat, text):
+                ln = text[:m.start()].count("\n")
+                line = lines[ln] if ln < len(lines) else ""
+                if ALLOW_MARK in line or any(a in line for a in ALLOW_SUBSTR):
+                    continue
+                print(f"  🔴 [{label}] {rp}:{ln + 1}  {line.strip()[:120]}")
+                hits += 1
+    return hits
+
+
 def selftest() -> int:
     """種一段必定命中的內容，確認掃描器真的會叫。"""
     import tempfile, os
@@ -156,7 +217,7 @@ def selftest() -> int:
         (root / "private" / "leaky.txt").write_text("192.168.9.9\n", encoding="utf-8")  # bornclean:allow（canary）
         rules, skip = load_deny(root)
         sk: list[str] = []
-        n = scan(root, GENERIC + rules, sk, skip)
+        n = scan(root, GENERIC + rules, sk, skip, worktree=True)
         if not sk:
             print("✗ 自我測試失敗：skip: 規則沒生效。", file=sys.stderr); return 1
     if n < 4:
@@ -170,7 +231,9 @@ def selftest() -> int:
 def main() -> int:
     if "--selftest" in sys.argv:
         return selftest()
-    root = pathlib.Path(sys.argv[1] if len(sys.argv) > 1 else ".").resolve()
+    args = [a for a in sys.argv[1:] if not a.startswith("--")]
+    worktree = "--worktree" in sys.argv
+    root = pathlib.Path(args[0] if args else ".").resolve()
     deny_rules, private_only = load_deny(root)
     rules = GENERIC + deny_rules
     dp = deny_path(root)
@@ -180,7 +243,8 @@ def main() -> int:
     elif dp.parent != root:
         print(f"  ℹ️  deny-list 取自 {dp}")
     skipped: list[str] = []
-    hits = scan(root, rules, skipped, private_only)
+    print("  範圍：" + ("工作目錄的實際檔案" if worktree else "git index（會被推上去的內容）"))
+    hits = scan(root, rules, skipped, private_only, worktree)
     if skipped:
         print(f"  ℹ️  跳過 {len(skipped)} 份私有限定文件（含操作真值、**絕不鏡像到公開版**）：")
         for f in sorted(set(skipped))[:8]:
