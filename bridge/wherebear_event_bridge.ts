@@ -199,12 +199,18 @@ while (true) {
       const p = msg.payload ?? {};
       const kind = String(p.kind ?? "");
       const name = String(p.name ?? "");
-      if (!kind || !name) return;
-      if (shouldCoalesce(kind, name)) {
-        log(`合併掉重複事件 ${kind}/${name}`);
+      // 具名事件（v1）帶名字；不具名事件（v2）是「有停留、但裁決判不出名字」，帶 decision_status
+      // ＋ reason_code。後者刻意放行：下游那片「什麼都沒有」本來就有三種成因（關掉回報／app 被
+      // 回收／沒移動），再加一種無聲的「判不出名字」會讓空白更不可解。放行＝把靜默變成看得見的狀態。
+      const unresolved = !name && p.decision_status === "unresolved";
+      if (!kind || (!name && !unresolved)) return;
+      // 合併鍵：具名用地點名。不具名一律沒名字 → 必須改用 visit_id，否則所有不具名事件會互相吃掉。
+      const dedupKey = name || `visit#${p.visit_id ?? "?"}`;
+      if (shouldCoalesce(kind, dedupKey)) {
+        log(`合併掉重複事件 ${kind}/${dedupKey}`);
         return;
       }
-      log(`事件 ${kind} ${name}`);
+      log(`事件 ${kind} ${name || `（不具名：${p.reason_code ?? "?"}）`}`);
       try {
         await appendEvent(p);
         callJudge();
