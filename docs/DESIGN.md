@@ -1,6 +1,6 @@
 # DESIGN — kc_wherebear 後端架構與決策
 
-> **English summary:** Records the rationale behind kc_wherebear's backend design as a numbered set of decisions (D1–D15), including choosing a self-hosted Supabase (BaaS) backend, a native Swift app, Supabase Auth + RLS bound to `auth.uid()` for writes, a read-only Edge Function for headless consumers, and the hot/cold dual-table model (`current_location` upsert + `location_history` append). It also covers the landmark-alias / reverse-geocode resolution layer, the pg_cron archival policy, the privacy stance, an optional Realtime channel for "just arrived at a named place" events (D13), how CLVisit dwells are keyed and fused with GPS-cluster stays so one visit never lands as two rows (D14), and how a stay is closed from two kinds of evidence — a newer arrival, or live positions proving the user is elsewhere (D15).
+> **English summary:** Records the rationale behind kc_wherebear's backend design as a numbered set of decisions (D1–D16), including choosing a self-hosted Supabase (BaaS) backend, a native Swift app, Supabase Auth + RLS bound to `auth.uid()` for writes, a read-only Edge Function for headless consumers, and the hot/cold dual-table model (`current_location` upsert + `location_history` append). It also covers the landmark-alias / reverse-geocode resolution layer, the pg_cron archival policy, the privacy stance, an optional Realtime channel for "just arrived at a named place" events (D13), how CLVisit dwells are keyed and fused with GPS-cluster stays so one visit never lands as two rows (D14), and how a stay is closed from two kinds of evidence — a newer arrival, or live positions proving the user is elsewhere (D15). Finally, it records why an event's place name is decided once, by adjudicating the live points around the arrival, with the departure reusing that snapshot — instead of being recomputed at emit time from whatever coordinate the row happens to hold, which made one dwell report two different names (D16).
 
 承接需求對齊（grill）的收斂。這份記「為什麼這樣設計」；隨實作演進回填。
 
@@ -25,6 +25,7 @@
 | **D13** | 到達／離開事件走獨立即時通道：**資料庫端解析地標 → 私有 broadcast**；消費端經 api-key 換一張「權限一無所有」的短效 token 訂閱 | headless 消費者要「剛到／剛離開命名地點」的即時信號，又不放 `service_role`／不破 D4 認證平面。實作與初稿不同，見下 |
 | **D14** | `visits` 唯一鍵＝`(user_id, arrived_at)`（不含座標）；停留段＝「CLVisit 管時間、live 聚合管位置」合併 | CLVisit 同一次停留投遞兩次且座標會漂 → 鍵含座標會生出關不掉的第二列；兩種偵測各對一半，互補不可二選一。見下 |
 | **D15** | 停留段的收尾接受**兩種證據**：新的到達、以及「當前位置持續在別處」的反證 | CLVisit 的離開投遞會遺失（app 被系統回收），且它對短距離移動不發新到達（實測 209 公尺、兩個半小時都沒有）→ 只等它給離開，停留會永遠開著 |
+| **D16** | 事件的地名改由**裁決**產生：一段停留只裁決一次、以 live 點群為證據、證據不足就不發具名事件；離開沿用到達的裁決結果 | 現行「發射當下用該列座標即時計算」讓同一段停留前後解出兩個名字（實例見下）。讀取層早已是「CLVisit 管時間、live 管位置與名稱」（D14），事件層沒沿用 → 同一系統兩套真相。**已實作並上線**（`20260727000004_visit_event_adjudication.sql`），見下 |
 
 > 註：D11（`landmarks` 自訂地標 alias）、D12（alias 命中免打外部 geocode）已在 migrations／`API_CONTRACT.md` 引用、尚未回填本表；本篇順序取 D13。
 
@@ -126,6 +127,72 @@ visits INSERT/UPDATE ──► 觸發器（資料庫端）
 **殘留邊界（明講未解）**：
 - 某段停留之後再也沒有任何新到達、人也沒再回報（換手機／長期不用）→ 仍會開著。要靠排程收尾，未做。
 - 反證式修剪只補「該關的沒關」，補不了「**該有的到達沒出現**」——那段停留在時間軸上是缺的。要根治得靠地標地理圍欄（`CLCircularRegion`）——進出即觸發、不受顯著移動門檻限制，代價是多一組背景事件來源要與 CLVisit 對帳。
+
+### 事件地名的裁決（D16 詳）
+
+**病灶**：`visits` 那一列同時扮演三個角色 —— 停留身分與時距、最新一次 CLVisit 座標的容器、以及對外事件名稱的即時計算依據。第二個角色會被後續感測值覆寫（D14 的鍵不含座標，是刻意的），而第三個角色每次發射都重算 → **`visit_id` 穩定、名字卻不穩定**。
+
+一次實例：同一個 `visit_id`，到達解出地標 A、離開解出地標 B（兩者相距 190 公尺）。同時段 live 點共 10 筆，全部解出 B —— 亦即**兩種證據並存，而事件層只採信了較差的那一種**。
+
+**這不是新哲學**：讀取層（D14 的 `stays_for_day`）早就是「CLVisit 管時間、live 聚合管位置與名稱」。事件層沒沿用同一套裁決，才在同一個系統裡長出兩套真相。
+
+**決定的形狀**：
+
+```
+到達回呼   ──►  建立「待裁決的停留候選」（不立刻發具名事件）
+                        │
+                        ▼
+           以「到達前後時窗內的 live 點群」為證據做一次裁決
+                        │
+        ┌───────────────┼───────────────┐
+        ▼               ▼               ▼
+    證據充分且一致    證據互相打架     證據不足
+    發具名事件(v1)   發不具名事件(v2) 發不具名事件(v2)
+                     ── 但只在「現行系統本來就會發」時才發 ──
+                        │
+                        ▼
+    裁決結果（地標 id + 名字快照 + 證據摘要）存起來
+    離開事件**沿用**它，不再拿離開回呼的新座標重新命名
+```
+
+**為什麼「證據不足」不能只是靜默**（消費端反論，採納）：下游看到的「什麼都沒有」原本就已經同時代表三種成因 —— 使用者關掉回報、app 被系統回收、沒移動所以沒事件。再加一種無聲的「有停留但判不出名字」，會讓那片空白更不可解；而下游被追問空白時的失效模式，正是本次事故的那一種（看到結果、看不到來由、就編一個）。
+
+所以**靜默必須變成一個看得見的狀態**：發一則不具名事件，帶裁決狀態 ＋ 原因碼 ＋ 證據筆數。這三樣正好都在「可下放的校準結論」清單內，不是被否決的原始指標。**v2 與「證據不足就不具名」必須同一版上線** —— 只上後者等於把猜測入口從命名那側搬到靜默那側。
+
+**隱私閘：從未命名過的地方一律不出聲。** 不具名事件只在 `legacy_would_emit`（＝CLVisit 座標命中地標、現行系統本來就會發）為真時才送；純陌生地點維持完全靜默，不因此開一條新的事件流。
+
+🔴 **但不要把它記成「涵蓋範圍一字不差」**（migration 檔頭那句註解寫得太滿，以本段為準）。**具名事件的涵蓋範圍會略微變大**：CLVisit 座標沒命中任何地標、但時窗內的 live 點一致指向某個地標時，改版後會發、改版前是靜默的。四天回放實測 1 例（3 筆 live 證據一致）。那是**修好了原本漏掉的真實到達**，講的仍是使用者自己命名過的地標 —— 隱私那條線沒有移動，移動的是漏報率。
+
+**相容性：靠 schema 版本分流。** 具名事件維持 `schema_version = 1`（原形狀 ＋ 新增裁決欄位，舊消費端忽略多餘的鍵）；不具名事件用 `schema_version = 2`。現行消費端會過濾掉非 1 的事件 → **自動略過 v2、不會因為缺 `name` 而爆炸**，待其更新後才看得到。
+
+**第二個被採納的反論**：裁決會讓具名事件在下游變成「系統背書過的名字」，信任度上升 → 門檻選錯的風險跟著上升。因此 `evidence_count` 隨**具名事件一起送**，不是只在不具名時才給。
+
+**四條刻意的取捨**：
+
+1. **不用固定延遲當修正機制。** 名字是從 `visits` 那一列算的，而該列在到達與離開之間沒有新的寫入 —— 延後只是晚一點讀到同一個座標。時限的角色是「收集證據的截止點」，不是「等座標自己變準」。
+2. **證據不足就不發**，而不是硬套一個粗糙的 CLVisit 座標。這與既有的「未命中地標就靜默」是同一個哲學，不是新規則。
+3. **不用「離開沿用到達的名字」當唯一解。** 它擋得住 A/B 翻轉，但會把錯的 A 固定到底 —— 只解決一致性、不解決正確性。沿用必須發生在**裁決之後**，不是在第一次感測之後。
+4. **可信度判斷留在上游、不下放給下游 LLM。** 下游沒有資料庫存取權，拿不到候選地標也無法重算；把 `distance_m` 之類的原始指標丟給它，只是把猜測往後推一層（見下）。
+
+**為什麼不採「發 `source` + `distance_m` 讓下游自己判斷」**（下游消費者提的方案，評估後否決）：
+
+- 事件通道只在 `resolve_alias` 命中時才發 → `source` 恆為 `user_landmark`，另兩個值在這條路上不可達，該欄位零資訊量。
+- `distance_m` 是「樣本到**命中地標**的距離」，不是「兩個候選地標之間的距離」。上述實例中，漂移後的樣本正是因為落進 A 的半徑才選中 A → 當時的 `distance_m` **很小**，看起來反而像高信心。它無法區分「座標對、名字對」與「座標錯、名字與錯座標一致」。
+- 要下放就得下放**校準過的**結論（狀態／reason code／證據筆數／演算法版本），而不是原始指標；否則等於邀請下游自己發明門檻。
+
+**實測支撐**（prod 唯讀回放最近四天、28 次到達，時窗取到達前 2 分鐘至後 5 分鐘）：
+
+```
+有 live 證據          23 / 28
+證據不足（要靜默）     5 / 28
+證據自相矛盾           0 / 28      <- 證據一致性比預期好
+與現行答案不同         2 / 28      <- 其一正是上述誤判案例，裁決後會答對
+```
+
+⚠️ 樣本只有 28 次、四天。上線的門檻（policy v1：時窗 −120／+300 秒、一致時 1 筆、純 live 共識 2 筆、誤差上限 100 公尺）就是照這份回放定的 —— 「只有 1 筆證據」在回放中出現過判錯（有一例會把真的在 A 店的那次判成 B），所以純共識那條要 2 筆。規則是「live 與 CLVisit 兩邊一致就發；不一致時只有 live 證據夠強才推翻；否則不具名」。
+
+**上線後仍待做**：用更長的歷史回放重驗門檻，並確認每日具名事件的損失率可接受。🔴 **調門檻＝新增一列 policy 並切 active，不要原地改**（原地改會讓歷史事件無法重現當時的判準）。
+
 
 ## 下游消費者 需求（R1–R4，併入 Phase 1）
 

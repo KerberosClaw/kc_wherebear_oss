@@ -14,10 +14,12 @@ export async function reverseGeocode(lat: number, lng: number): Promise<string |
     if (!res.ok) return null;
     const j = await res.json();
     const a = j.address ?? {};
-    const parts = [
-      a.neighbourhood || a.suburb || a.quarter || a.hamlet,
-      a.city || a.town || a.village || a.county,
-    ].filter(Boolean);
+    // Road-level label "<road> · <district>" (API_CONTRACT §3). Previously picked only
+    // 里/neighbourhood + city → too coarse; the road name is already in the response.
+    // Degrade gracefully to area-only when no road is present (rural/park points).
+    const road = a.road || a.pedestrian || a.footway || a.neighbourhood || a.suburb;
+    const area = a.suburb || a.city_district || a.district || a.town || a.city || a.county;
+    const parts = [...new Set([road, area].filter(Boolean))];
     if (parts.length) return parts.join(" · ");
     if (typeof j.name === "string" && j.name) return j.name;
     if (typeof j.display_name === "string") {

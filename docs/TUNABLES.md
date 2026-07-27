@@ -1,6 +1,6 @@
 # TUNABLES — 可調參數速查
 
-> **English summary:** A quick-reference for kc_wherebear's tunable behavior parameters and where each one lives in the source. It lists the stay-detection thresholds (minimum dwell, cluster radius, gap), the app's location-report frequencies and desired accuracy for saver/standard modes, the bridge daemon's poll interval, and the geocode cache's coordinate-rounding precision. It records current values only — to change a parameter, edit it at its source.
+> **English summary:** A quick-reference for kc_wherebear's tunable behavior parameters and where each one lives in the source. It lists the stay-detection thresholds (minimum dwell, cluster radius, gap), the app's location-report frequencies and desired accuracy for saver/standard modes, the bridge daemon's poll interval, and the geocode cache's coordinate-rounding precision. It also covers the core-window union used when fusing a CLVisit dwell with a GPS cluster, and the app-side dedup window that drops a location fix delivered twice by two triggers. It records current values only — to change a parameter, edit it at its source.
 
 > 「行為門檻／頻率」類參數的單一速查。**問參數先看這、免撈 code。** 本檔只記現值＋來源位置；要改請改對應來源。
 > 🔴 born-clean：本檔只有通用參數，無座標／金鑰／身分。
@@ -11,7 +11,7 @@
 |---|---|---|
 | `p_min_dwell_s` | **600（10 分鐘）** | 同一處待逾此秒數才算一個「停留」；路過／短停不計。**時間軸只列 ≥ 此門檻的停留** |
 | `p_radius_m` | 150 公尺 | 判「同一處」的半徑；離開此半徑＝換點 |
-| `p_gap_s` | 1800（30 分鐘） | 兩點時間差逾此＝斷開群集（中間沒回報視為離開） |
+| `p_gap_s` | **28800（8 小時）** | 兩點時間差逾此＝斷開群集。🔴 **不要調回分鐘級**：人不動時 significant-change 本來就不觸發，30 分鐘會把整夜／一整個白天切成碎片（實測久坐不動最長合法沉默 7 小時 15 分；整夜的長停會整段消失）。不同地點靠下面的距離門檻擋，不靠這條 |
 
 app 走 `my_today_stays` / `my_stays_range` / `my_stays_days`，皆用上述**預設值**。要改：改 migration 的 `default`（需 `create or replace` 重套 dev/prod），或呼叫端顯式傳參。
 
@@ -19,8 +19,15 @@ app 走 `my_today_stays` / `my_stays_range` / `my_stays_days`，皆用上述**�
 
 | 參數 | 現值 | 意義 |
 |---|---|---|
-| `p_pair_radius_m` | **150 公尺** | CLVisit 段與 live 聚合段視為「同一段停留」的距離門檻（與 `detect_stays` 的 `p_radius_m` 同值）；配對成功者時間用 CLVisit、位置／名稱用 live 中心 |
+| `p_pair_radius_m` | **150 公尺** | CLVisit 段與 live 聚合段視為「同一段停留」的距離門檻（與 `detect_stays` 的 `p_radius_m` 同值）；配對成功者**時間取兩者聯集**、位置／名稱用 live 中心 |
+| `p_core_radius_m` | **100 公尺** | 延伸停留邊界時，只採計「距合併中心此距離內」的 live 點首末（＝人真的在那裡的證據），把離場／接近路段排除在外 |
 | alias 比對容差 | **CLVisit 自報的 `horizontalAccuracy`** | 僅套在「沒配對到 live 段」的 CLVisit 段（粗座標）；配對到的用 live 中心、容差 0。無魔術常數，舊列 `accuracy` 為 null ⇒ 不放寬 |
+
+> **時間為什麼取「核心窗聯集」而非單純聯集**：兩邊是互補證據 —— CLVisit 在人不動時看得見（live 幾乎失明），live 在 CLVisit 沒觸發或已收尾時看得見。原規則「一律用 CLVisit」只有在 live 段必然較窄時才成立；`p_gap_s` 放寬到 8 小時後前提反過來，一整天的長停被 21 分鐘的 CLVisit 截斷。
+>
+> 🔴 **但不能直接取 max**：聯集單調只增，會保留兩邊所有「把區間撐大」的誤差、丟棄所有「收緊」的修正。而收緊那側正是刻意做的品質機制（`visits_close_on_departure_evidence` 算出的誠實離開時刻），撐大那側正是已知有污染的（`detect_stays` 判同一處是距**錨點**150 公尺，人往外走的頭兩百公尺仍被吃進群集）。實測某次短停：直接聯集把 9.6 分變 22.7 分，多出來的全是走路時間（延伸到的那點離該處 129 公尺、離下一個地點只剩 82 公尺）。改用核心窗後回到 9.6 分。
+>
+> `p_core_radius_m` 在 60～120 公尺之間輸出完全相同（平台中央，不是挑中的臨界值），**150 公尺會退化成直接聯集** —— 不要調到那裡。
 
 > 同一地點時而解出 alias、時而掉回 geocode 路名，多半是 **landmark 自身半徑太小**（實測某個常去地點，連 live 精確中心都會落到 120 公尺外）。先調 `landmarks.radius`，不要動這裡。
 
@@ -33,7 +40,10 @@ app 走 `my_today_stays` / `my_stays_range` / `my_stays_days`，皆用上述**�
 | desiredAccuracy | saver＝百米 / standard＝十米 |
 | 背景 | significant-change（~500m 位移）＋ CLVisit（靜止久留，iOS 自排程） |
 | 即時顯示流（地圖可見時） | 連續 `startUpdatingLocation`（`distanceFilter=10m` 濾 GPS 抖動），只刷新顯示、不寫 DB |
+| 同一次定位去重視窗 | **2 秒**（`fixDedupWindow`）；座標**完全相等**且在此秒數內＝同一個 fix 被兩條觸發源各回一次，只寫一列 |
 | outbox 上限 | 1000 筆 |
+
+> 去重視窗刻意遠小於最密的回報間隔（標準輪詢 60 秒），所以不會吃掉正常取樣；比對用座標完全相等、**不是**距離門檻——距離門檻會連真實小幅移動一起丟掉。
 
 ## bridge daemon（`bridge/wherebear_bridge.py`，env 設定）
 

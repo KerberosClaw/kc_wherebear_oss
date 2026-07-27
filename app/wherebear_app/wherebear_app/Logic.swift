@@ -113,6 +113,8 @@ final class LocationDelegate: NSObject, CLLocationManagerDelegate {
     @ObservationIgnored private let visitOutboxKey = "wb_visit_outbox"  // 離線/連不到期間累積的 CLVisit 停留；回線補送（原本 try? 會靜默丟）
     @ObservationIgnored private let visitOutboxCap = 500
     @ObservationIgnored private let reportingKey = "wb_reporting"       // 回報開關要跨啟動記住（見 init 的自動恢復）
+    @ObservationIgnored private var lastReportedFix: (lat: Double, lng: Double, at: Date, accuracy: Double)?  // 見 isRedundantFix：擋同一次定位被兩條觸發源各寫一列
+    @ObservationIgnored private let fixDedupWindow: TimeInterval = 2     // 同座標且此秒數內＝同一次定位（實測重複投遞相距 0.06～0.6 秒）
 
     init() {
         if UserDefaults.standard.string(forKey: "wb_frequency") == "standard" { frequency = .standard }
@@ -156,7 +158,7 @@ final class LocationDelegate: NSObject, CLLocationManagerDelegate {
         // 🔴 冷啟動自動恢復回報：significant-change 與 CLVisit 的監控只在 start() 裡註冊，
         // 而 start() 原本唯一的入口是熊掌按鈕、開關狀態又沒存下來 → 任何一次冷啟動（被系統
         // 記憶體壓力 kill 後重開、或 iOS 為了定位事件在背景把 app 叫起來）都會變成「監控沒
-        // 註冊」：那次事件收不到，而且之後 iOS 也不會再叫它。實測 2026-07-25 有數段數小時的
+        // 註冊」：那次事件收不到，而且之後 iOS 也不會再叫它。實測有數段數小時的
         // 空白正是這個形狀。開關存進 UserDefaults、啟動時照著恢復，這條路才接得起來。
         if UserDefaults.standard.bool(forKey: reportingKey) { start() }
     }
@@ -197,6 +199,36 @@ final class LocationDelegate: NSObject, CLLocationManagerDelegate {
         manager.stopMonitoringSignificantLocationChanges()
         manager.stopMonitoringVisits()
         pollTask?.cancel(); pollTask = nil
+        Task { await closeOpenVisits() }   // 停止的當下是我們最後一次能講話的機會，見下
+    }
+
+    // 按下停止＝明確的「我不再回報了」。此後 iOS 不送任何事件，還開著那段停留的 departed_at
+    // 就永遠補不上；讀取層看到它是空的會當成「人還在那裡」，往後每一天都畫一段（實例：
+    // 某次深夜到達的停留，在停止回報後就這樣掛著）。停止是最後一次能講話的機會。
+    //
+    // 用 PATCH ＋ filter 而非 POST upsert：POST 的去重鍵是 arrived_at，app 手上沒有那個值
+    // （到達可能發生在好幾個小時前、甚至是上一次冷啟動之前），要先查一次才知道。
+    // PATCH 直接讓 PostgREST 用「這個人的、還沒關的」把所有孤兒列一次收掉，省一趟往返。
+    //
+    // 失敗不進補送佇列：佇列要等下一次 report() 才 flush，而回報正是剛被停掉的東西 ——
+    // 排進去等於永遠不會送出。漏掉的那次由後端封頂接住（visit_open_until，寬限 24 小時），
+    // 兩層是刻意的：這一層準（知道確切時刻），後端那層兜底（app 沒機會講話時也不會爛）。
+    //
+    // 🔴 要跟系統借背景執行時間：按下停止之後把 app 從多工滑掉是常見動作（例如接下來要用
+    // 會改寫定位的工具，得先確定這支不再回報）。stop() 是同步返回的，這個請求在它自己的
+    // Task 裡跑 —— app 一被滑掉就會被砍斷，departed_at 補不上，那段停留要等後端封頂
+    // 24 小時後才收掉。beginBackgroundTask 跟系統要一段緩衝把它送完。
+    // 不掛 expirationHandler：WBClient 的逾時是 12 秒（resource 20 秒），遠短於系統給的
+    // 額度，不會撐到過期被強制回收。
+    func closeOpenVisits() async {
+        guard let uid = WBAuth.shared.userId else { return }
+        let bg = UIApplication.shared.beginBackgroundTask(withName: "wb-close-visits")
+        defer { if bg != .invalid { UIApplication.shared.endBackgroundTask(bg) } }
+        let iso = ISO8601DateFormatter(); iso.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        try? await WBClient.rest("PATCH", table: "visits",
+            query: [URLQueryItem(name: "user_id", value: "eq.\(uid)"),
+                    URLQueryItem(name: "departed_at", value: "is.null")],
+            body: ["departed_at": iso.string(from: Date())])
     }
 
     // 地圖畫面顯示用（與「回報開關」解耦）：進地圖 seed 一次即時位置 + 開羅盤，離開關羅盤。
@@ -243,8 +275,44 @@ final class LocationDelegate: NSObject, CLLocationManagerDelegate {
         }
     }
 
+    // 同一次定位被寫成兩列的判準（純函式、可單測）。
+    //
+    // 為什麼需要：significant-change 監控與 requestLocation() 掛在同一個 manager／同一個 delegate 上，
+    // 兩邊各回一次就各寫一列。prod 實測相鄰兩列相距 0.06～0.6 秒、座標與誤差完全相同，佔比從 1.1%
+    // 爬到 4.4%。DB 端的 on_conflict 含 captured_at，毫秒不同就擋不掉。
+    //
+    // 後果不是多佔幾列，是 detect_stays 的 confidence＝點數÷6：一段只有 3 個點的短停信心 0.5，
+    // 多一列變 4 點、信心 0.667 → 跨過 app 的 0.6 門檻，「訊號稀疏、可能不準」的標記消失。
+    // 錯的方向是把不確定顯示成確定。
+    //
+    // 🔴 用「座標完全相等」而非距離門檻：距離門檻會連真的小幅移動一起吃掉。重複投遞本來就是
+    // 同一個 fix 的兩份拷貝、座標一位不差，精確比對就夠，不需要也不該放寬。
+    // 時間差取絕對值：兩條觸發源誰先到不保證，亂序時同樣要擋。
+    //
+    // 🔴 accuracy 只准「不比留下那筆好」才丟：座標相同不代表誤差相同 —— prod 25 對同座標成對點
+    // 裡有 8 對 accuracy 不同（實測最誇張一對 4.0m→7.8m）。而 accuracy 是有下游在吃的：
+    // departure_evidence 的自適應距離門檻加它、visit_event_channel 拿它放寬地標比對。
+    // 丟掉較準的那筆＝把後端的判斷餵差。實測 25/25 第二筆都是等於或更差、這條不會少擋任何一對，
+    // 但它讓「丟掉更準的點」從不可能發生，而不是靠運氣。
+    // 不設容差、不寫魔術常數：真有更準的第二筆就放它進去，代價只是留下一列重複（＝現狀，不更糟）。
+    static func isRedundantFix(lat: Double, lng: Double, at: Date, accuracy: Double,
+                               previous: (lat: Double, lng: Double, at: Date, accuracy: Double)?,
+                               window: TimeInterval) -> Bool {
+        guard let p = previous, lat == p.lat, lng == p.lng else { return false }
+        guard accuracy >= p.accuracy else { return false }   // 這筆更準 → 它帶了新資訊，放行
+        return abs(at.timeIntervalSince(p.at)) < window
+    }
+
     private func report(_ loc: CLLocation) async {
         guard let uid = WBAuth.shared.userId else { return }
+        // 判斷與記錄都在第一個 await 之前：LocationReporter 是 @MainActor，同步段不會被另一個
+        // Task 插隊 → 兩次回呼幾乎同時進來時，第二次一定看得到第一次寫下的 lastReportedFix。
+        let c = loc.coordinate
+        let acc = max(loc.horizontalAccuracy, 0)   // 與下方 point 送出的值同一套正規化，比對才對得上
+        if Self.isRedundantFix(lat: c.latitude, lng: c.longitude, at: loc.timestamp, accuracy: acc,
+                               previous: lastReportedFix, window: fixDedupWindow) { return }
+        // 寫在送出「之前」：送失敗會進 outbox，那份拷貝已經在佇列裡了，重複的第二次不該再補一份。
+        lastReportedFix = (c.latitude, c.longitude, loc.timestamp, acc)
         await flushOutbox(uid: uid)   // 先把離線期間累積的點一次補送（用戶要的「回線一口氣打上去」）
         await flushVisitOutbox()      // 停留佇列同樣補送
         let iso = ISO8601DateFormatter(); iso.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
