@@ -203,14 +203,25 @@ while (true) {
       // ＋ reason_code。後者刻意放行：下游那片「什麼都沒有」本來就有三種成因（關掉回報／app 被
       // 回收／沒移動），再加一種無聲的「判不出名字」會讓空白更不可解。放行＝把靜默變成看得見的狀態。
       const unresolved = !name && p.decision_status === "unresolved";
-      if (!kind || (!name && !unresolved)) return;
-      // 合併鍵：具名用地點名。不具名一律沒名字 → 必須改用 visit_id，否則所有不具名事件會互相吃掉。
-      const dedupKey = name || `visit#${p.visit_id ?? "?"}`;
+      // 回報結束（v3）：使用者按下「停止回報」。它宣告的是「我們從此看不到了」，**不是**離開某地。
+      // 天生沒有 name（可能帶 last_known_name 當參考），所以必須另外放行，否則會被上面那道濾網丟掉。
+      const coverage = kind === "coverage_ended";
+      if (!kind || (!name && !unresolved && !coverage)) return;
+      // 合併鍵：具名用地點名；不具名用 visit_id（否則所有不具名事件會互相吃掉）。
+      // 🔴 回報結束用「事件本身的時刻」當身分：它不綁 visit，若沿用 kind:name 這種時間窗合併，
+      //    「停止→開始→兩分鐘內再停止」的第二次會被當成重複吃掉 —— 那是兩個合法的不同事件。
+      const dedupKey = coverage
+        ? `coverage@${p.occurred_at ?? "?"}`
+        : (name || `visit#${p.visit_id ?? "?"}`);
       if (shouldCoalesce(kind, dedupKey)) {
         log(`合併掉重複事件 ${kind}/${dedupKey}`);
         return;
       }
-      log(`事件 ${kind} ${name || `（不具名：${p.reason_code ?? "?"}）`}`);
+      log(`事件 ${kind} ${
+        coverage
+          ? `（回報結束，最後位置：${p.last_known_name ?? "未命名"}）`
+          : (name || `（不具名：${p.reason_code ?? "?"}）`)
+      }`);
       try {
         await appendEvent(p);
         callJudge();

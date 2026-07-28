@@ -23,8 +23,8 @@ Realtime 走 Phoenix channel 協定，Python 標準函式庫沒有 WebSocket、�
 ## 事件通道長怎樣
 
 ```
-手機 ──► visits 表 ──► 資料庫觸發器（查 landmarks、命中才發）
-                            │  payload 只有解析後的名字，沒有座標
+手機 ──► visits 表 ──► 資料庫觸發器（具名事件要命中 landmarks 才發）
+                            │  payload 一律不含座標；具名事件只帶解析後的名字
                             ▼
         event bridge ◄── 私有 broadcast（wb:events:<uid>）
              │  wb_ 金鑰 ──換發──► 短效 token（權限一無所有、只能聽自己那條）
@@ -33,6 +33,14 @@ Realtime 走 Phoenix channel 協定，Python 標準函式庫沒有 WebSocket、�
 ```
 
 判定「這是不是命名過的地點」留在資料庫（`landmarks` 住那裡），所以 bridge 不需要、也拿不到讀表的權限。
+
+⚠️ 同一個頻道上**不是每一則都有名字**，別把「收到事件」等同於「命中了某個地標」：
+- **不具名的到達／離開**：有停留、但裁決判不出名字。只在「舊規則本來就會出聲」時才發，
+  所以未命名地點仍維持靜默。
+- **`coverage_ended`（回報結束）**：與地標無關，宣告的是「我們從此看不到了」，不是「他離開了某地」。
+
+bridge 對這些一律**只轉送不判斷**（連 `schema_version` 都不看）——理由與完整契約見
+[`docs/API_CONTRACT.md` §6.5](../docs/API_CONTRACT.md)。
 
 ## 設定
 
