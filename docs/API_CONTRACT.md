@@ -1,6 +1,6 @@
 # API_CONTRACT — kc_wherebear 介面 SSOT
 
-> **English summary:** This is the single source of truth for kc_wherebear's interface contract. It defines the two authentication planes — the owner plane over Supabase PostgREST guarded by RLS, and the headless read plane over Edge Functions authenticated with a `wb_`-prefixed API key — along with the request/response payloads for every table and read endpoint. It also specifies the `resolved_name` resolution order (user alias > geocode cache > reverse-geocode > null), the timestamp/unit/timezone conventions, the error shapes and status codes, and the bridge's local JSON schema consumed by downstream readers.
+> **English summary:** This is the single source of truth for kc_wherebear's interface contract. It defines the two authentication planes — the owner plane over Supabase PostgREST guarded by RLS, and the headless read plane over Edge Functions authenticated with a `wb_`-prefixed API key — along with the request/response payloads for every table and read endpoint. It also specifies the `resolved_name` resolution order (user alias > geocode cache > reverse-geocode > null), the timestamp/unit/timezone conventions, the error shapes and status codes, and the bridge's local JSON schema consumed by downstream readers. On the realtime event channel, `schema_version` is versioned **per `kind`** rather than globally — consumers must branch on `kind` first, then on version — and alongside `arrival`/`departure` there is a `coverage_ended` event that declares "we stopped observing", which is deliberately *not* a claim that the user left anywhere.
 
 > 這份是**介面契約單一真相源**。7 支 spec 的 machine-checkable AC 都掛這份 —— 任何 endpoint / payload / 錯誤形狀改動先改這裡，再改 spec，避免多消費者（app / bridge / 下游消費者）介面漂移。
 > 對齊：DESIGN D1–D12、REQUIREMENT R1–R4。🔴 **born-clean**：本檔所有座標 / 金鑰 / 時間全是佔位示意值（null-island `0.0`、`wb_xxxx`），無真值。
@@ -247,23 +247,40 @@ bridge daemon 拉 §2 兩讀口 → **atomic 寫**一份本地 JSON；下游（�
 
 ---
 
-## 6.5 事件通道（D13 · 到達／離開）
+## 6.5 事件通道（D13 · 到達／離開／回報結束）
 
 ### 6.5.1 broadcast payload
 
-私有頻道 `wb:events:<user_id>`、event 名 `visit`。由資料庫觸發器產生，**只有落在使用者 `landmarks` 半徑內才發**。
+私有頻道 `wb:events:<user_id>`、event 名 `visit`。由資料庫觸發器產生。
+
+**隱私閘**：具名事件（v1）只在落在使用者 `landmarks` 半徑內才發。
+但同一個頻道上還有兩種**天生沒有名字**的事件，別誤以為「有事件＝有命中地標」：
+- **v2 不具名**（`arrival`/`departure`）：有停留、但裁決判不出名字。只在「舊規則本來就會出聲」時才發
+  （`legacy_would_emit`），所以**未命名地點仍維持靜默**。
+- **v3 `coverage_ended`**：回報結束，與地標無關。見 §6.5.3。
 
 ```jsonc
 {
-  "schema_version": 1,
+  "id": "550e8400-e29b-41d4-a716-446655440000", // 送出時產生的事件 uuid（見下方說明）
+  "schema_version": 1,                          // 1=具名、2=不具名；依 kind 分版，見 §6.5.2
   "kind": "arrival" | "departure",
-  "name": "<landmarks alias>",                // 🔴 只有名字，不含原始座標
+  "name": "<landmarks alias>",                // 🔴 只有名字，不含原始座標；v2 時為 null
   "visit_id": 123,
   "arrived_at": "2026-01-01T09:00:00+08:00",
   "departed_at": "2026-01-01T18:00:00+08:00", // arrival 時為 null
-  "dwell_s": 32400                            // arrival 時為 null（那時還算不出來）
+  "dwell_s": 32400,                           // arrival 時為 null（那時還算不出來）
+  // 以下四欄自裁決機制起隨事件一起送
+  "decision_status": "resolved" | "unresolved",
+  "reason_code": "clvisit_live_agree",        // 判準走哪一條
+  "evidence_count": 2,                        // 支持這個名字的定位點數
+  "algorithm_version": "visit_name_v1",
+  "policy_version": 1
 }
 ```
+
+🔴 **`id` 由送出端（`realtime_send_strict`）在送出當下產生**，是這「一則訊息」的識別碼，不是業務欄位。
+同一段停留的到達與離開是兩則不同訊息、`id` 不同。消費端不應拿它當停留身分 ——
+那是 `visit_id` 的職責，而 `coverage_ended` 根本沒有 `visit_id`（它不綁停留）。
 
 ### 6.5.2 事件檔（下游消費契約）
 
@@ -276,7 +293,41 @@ event bridge 把收到的事件 append 成**每日一檔** `events_YYYYMMDD.json
 - **`received_at` 只用來排序與記水位，不可拿來判新鮮度** —— 離線佇列補傳會在數小時後才把舊的到達寫進資料庫，那時 `received_at` 是「剛剛」。判新鮮度要看 `arrived_at` / `departed_at`。
 - 寫入者只有 event bridge 一個，讀取端只 append-only 地往後讀。
 - 同地點同類型的重複事件在 bridge 端已先合併（見 `TUNABLES.md`）。
-- 破壞性改動 bump `schema_version`；消費端對不上的版本應視為不認識、跳過。
+- 🔴 **`schema_version` 依 `kind` 分版，不是全域單一版本**：同一個檔案裡不同 `kind` 的版本號各自演進
+  （目前 `arrival`/`departure` 是 1（具名）與 2（不具名）、`coverage_ended` 是 3）。
+  消費端要**先看 `kind` 再看版本**；只用版本號當總開關會把不相干的事件一起濾掉。
+- 破壞性改動 bump 該 `kind` 的 `schema_version`；消費端對不上的版本應視為不認識、跳過。
+- 🔴 **「跳過未知版本」是最終消費端的責任，不是 bridge 的。** bridge 刻意是**純轉送**：
+  它的放行條件只有三條、且**刻意寬鬆**：有 `kind`，且（有 `name`／`decision_status="unresolved"`／
+  `kind="coverage_ended"`）三者之一。**不檢查 `schema_version`，也不檢查該 `kind` 是否為已知類型** ——
+  例如任何帶著 `decision_status="unresolved"` 的未知 `kind` 都會被放行。
+  這是刻意的取捨：bridge 若自作主張過濾，新版事件在 bridge 更新前會被**永久吞掉**
+  （事件是一次性的、沒有補送）。代價是 **未知版本仍會消耗下游的喚醒次數** ——
+  真正的版本過濾必須做在會消耗額度的那一層。
+
+### 6.5.3 `coverage_ended`（回報結束）
+
+使用者按下「停止回報」時發出。**它宣告的是「我們從此看不到了」，不是「他離開了某地」** ——
+這兩件事在語意上不同：按停止時人可能還待在原地。
+
+```jsonc
+{
+  "id": "550e8400-e29b-41d4-a716-446655440000", // 同 §6.5.1：送出時產生的訊息 uuid
+  "schema_version": 3,
+  "kind": "coverage_ended",
+  "occurred_at": "2026-01-01T18:00:00+08:00",       // 觀測邊界（已做時鐘防呆夾取）
+  "last_observed_at": "2026-01-01T17:58:12+08:00",  // 最後一次真的看到人的時刻；無資料時為 null
+  "last_known_name": "<landmarks alias>",           // 就 last_observed_at 那一點當場解析；解不出為 null
+  "reason": "reporting_stop",
+  "source_confidence": "inferred_from_http_shape"
+}
+```
+
+- 🔴 **不帶 `dwell_s`、不帶 `visit_id`、不帶座標。** 它不是停留事件，不得被當成離開來渲染。
+- `last_known_name` **只取那一個時間點的解析結果**，不往前搜尋「最後一個有名字的地方」——
+  否則在未命名地點按停止時會洩漏前一個地點。
+- 合併鍵是 `occurred_at`（事件本身的身分），不是地點名：
+  「停止 → 開始 → 兩分鐘內再停止」是兩個合法事件，不可被時間窗合併吃掉。
 
 ## 7. 範圍界線
 
