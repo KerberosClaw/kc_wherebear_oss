@@ -1,0 +1,44 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+# 唯讀就夠：這幾關只掃檔案，不需要寫 repo。
+permissions:
+  contents: read
+
+jobs:
+  born-clean:
+    name: born-clean（秘密／身分／文件）
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0   # gitleaks 要掃歷史
+
+      # ① 秘密
+      - name: gitleaks
+        uses: gitleaks/gitleaks-action@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      # ② 身分／私域值
+      #    公開版沒有 .bornclean-deny（那份是私庫專用、gitignored）——
+      #    本 repo 本來就不該有私有限定檔，所以「只跑通用樣態」在這裡是正確狀態，不是降級。
+      - name: born-clean scan
+        run: python3 scripts/bornclean_scan.py
+
+      # ③ 文件：相對連結 + mermaid 真的渲染得出來
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+      - name: install mermaid-cli
+        run: npm i -g @mermaid-js/mermaid-cli
+      - name: docs lint
+        run: python3 scripts/docs_lint.py

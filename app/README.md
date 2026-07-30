@@ -1,4 +1,11 @@
-# app/ — iOS（FE）
+# app/ — 客戶端（FE）
+
+| 目錄 | 平台 | 狀態 |
+|---|---|---|
+| `wherebear_app/` | iOS（SwiftUI） | Phase 1 已完成、prod 上線可裝用 |
+| `wherebear_app_android/` | Android | **尚未進 repo —— 歡迎 PR**（見文末） |
+
+## iOS（`wherebear_app/`）
 
 native SwiftUI app：把最新位置低頻回報到你自己的 Supabase，並看**當前位置 / 今天足跡**、管理**讀取金鑰**與**地標命名**。**Phase 1 已完成、prod 上線可裝用**（架構全景見 [`../docs/ARCHITECTURE.md`](../docs/ARCHITECTURE.md) §4）。不是連續高精度追蹤。
 
@@ -30,3 +37,14 @@ native SwiftUI app：把最新位置低頻回報到你自己的 Supabase，並�
 - **離線 outbox**：寫失敗本地佇列、回前景補送。
 - **顯示即時流**（地圖，`distanceFilter=10m`）：只更新畫面、**不寫 DB**（抗抖）。
 - `captured_at` ＝ GPS 定位那刻的時間戳（非送出時間）；超過 `Config.staleThresholdSeconds`（15 分）→ UI 標「位置可能不是最新」。參數速查 → [`../docs/TUNABLES.md`](../docs/TUNABLES.md)。
+
+---
+
+## 要貢獻 Android 版
+
+歡迎 PR。路徑放 **`app/wherebear_app_android/`**，跟 iOS 那包並列。
+
+- **端點與金鑰照 iOS 那套**：值不進 repo，走 gitignored 的本機設定檔（iOS 是 `Config.local.swift`，Android 建議 `local.properties`），並附一份 `.example` 讓別人 fresh checkout 補得起來。**任何 key / URL / 私網位址都不要 commit。**
+- **契約以 [`../docs/API_CONTRACT.md`](../docs/API_CONTRACT.md) 為準**，那份是唯一事實來源。特別注意事件通道：`schema_version` 是**按 `kind` 各自版本**，而 `coverage_ended` 的語意是「我們停止觀測了」，**不等於**使用者離開了任何地方。
+- **請附 JVM 單元測試**（`./gradlew test` 跑得到的那種）。instrumented test 需要模擬器，CI 上不跑。
+- 平台差異的判準請攤在 config 裡、別藏在邏輯中間——例如 Android 沒有 `CLVisit`，停留偵測的半徑與門檻要看得見、可調、可被測試。
