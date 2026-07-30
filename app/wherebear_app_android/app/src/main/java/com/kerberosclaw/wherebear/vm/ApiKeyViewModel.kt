@@ -44,7 +44,7 @@ class ApiKeyViewModel : ViewModel() {
         }.onSuccess { data ->
             _keys.value = data.asJsonArray().map { r ->
                 ApiKeyInfo(
-                    id = r.opt("id").toString(),
+                    id = r.optString("id"),
                     name = r.optString("name"),
                     keyLast4 = r.optString("key_last4"),
                     lastUsedAt = if (r.isNull("last_used_at")) null else WBTime.parse(r.optString("last_used_at")),

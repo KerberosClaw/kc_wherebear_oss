@@ -39,7 +39,7 @@ class LandmarkViewModel : ViewModel() {
                 val la = r.optDouble("lat"); val lo = r.optDouble("lng")
                 if (la.isNaN() || lo.isNaN()) null
                 else Landmark(
-                    id = r.opt("id").toString(),
+                    id = r.optString("id"),
                     alias = r.optString("alias"),
                     coordinate = LatLng(la, lo),
                     radius = r.optInt("radius", 100),
