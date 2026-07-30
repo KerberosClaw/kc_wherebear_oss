@@ -1,0 +1,16 @@
+# local.properties.example — 對應 iOS 的 Config.local.swift.example
+# fresh checkout: cp local.properties.example local.properties 再填值（local.properties 是 gitignored）
+#
+# sdk.dir 由 Android Studio 自動寫入，這裡不用填。
+#
+# prod 端點＝你的 Supabase 專案；anon key＝Dashboard → Settings → API → anon public
+WB_SUPABASE_URL=https://<你的專案 ref>.supabase.co
+WB_SUPABASE_ANON_KEY=<你的 prod anon public key>
+
+# dev 端點（debug build 用）＝你 mac 的 LAN IP（Android 模擬器有專用的宿主機別名，見 README_ANDROID.md）
+WB_DEV_SUPABASE_URL=http://192.168.x.x:54321
+# supabase 本地 demo anon key（公開常數、非機密、全球一致） gitleaks:allow
+WB_DEV_SUPABASE_ANON_KEY=eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZS1kZW1vIiwicm9sZSI6ImFub24iLCJleHAiOjE5ODM4MTI5OTZ9.CRXP1A7WOeoJeXxjNni43kdQwgnWNReilDMblYTn_I0 # gitleaks:allow
+
+# Google Maps SDK for Android 的 API key
+WB_MAPS_API_KEY=<你的 Maps API key>
