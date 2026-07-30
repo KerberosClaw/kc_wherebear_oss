@@ -1,0 +1,100 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+# 唯讀就夠：這幾關只掃檔案，不需要寫 repo。
+permissions:
+  contents: read
+
+jobs:
+  born-clean:
+    name: born-clean（秘密／身分／文件）
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0   # gitleaks 要掃歷史
+
+      # ① 秘密
+      - name: gitleaks
+        uses: gitleaks/gitleaks-action@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      # ② 身分／私域值
+      #    公開版沒有 .bornclean-deny（那份是私庫專用、gitignored）——
+      #    本 repo 本來就不該有私有限定檔，所以「只跑通用樣態」在這裡是正確狀態，不是降級。
+      - name: born-clean scan
+        run: python3 scripts/bornclean_scan.py
+
+      # ③ 文件：相對連結 + mermaid 真的渲染得出來
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+      - name: install mermaid-cli
+        run: npm i -g @mermaid-js/mermaid-cli
+
+      # mmdc 底下是 puppeteer/Chrome。CI 容器沒有 user namespace，Chrome 的沙箱起不來，
+      # 每張圖都會渲染失敗（本機正常、CI 全紅就是這個）。給它 --no-sandbox 即可；
+      # 這裡跑的是我們自己 repo 的 .md，沒有不受信任的輸入。
+      - name: puppeteer config for mmdc
+        run: |
+          # ① 沙箱：CI 容器沒有 user namespace，Chrome 預設沙箱起不來。
+          echo '{"args":["--no-sandbox","--disable-setuid-sandbox"]}' > "$HOME/.puppeteerrc.json"
+          echo "PUPPETEER_CONFIG=$HOME/.puppeteerrc.json" >> "$GITHUB_ENV"
+          # ② 瀏覽器本體：npm -g 裝 mermaid-cli 時 puppeteer 不一定把 Chrome 下載到
+          #    runner 使用者讀得到的位置。ubuntu runner 映像自帶 Chrome，直接指過去最穩。
+          CHROME="$(command -v google-chrome || command -v chromium-browser || command -v chromium || true)"
+          if [ -z "$CHROME" ]; then npx --yes puppeteer browsers install chrome; else echo "PUPPETEER_EXECUTABLE_PATH=$CHROME" >> "$GITHUB_ENV"; fi
+          echo "chrome=$CHROME"
+
+      - name: docs lint
+        run: python3 scripts/docs_lint.py
+
+  # ─────────────────────────────────────────────────────────────────────────
+  # Android（社群貢獻）。用「有沒有動到那個目錄」決定跑不跑：
+  #   · 目錄還不存在時 → 這個 job 直接 skip，不影響現有綠燈
+  #   · PR 一旦動到 app/wherebear_app_android/** → 自動跑，沒有可跑的測試就是紅的
+  # 只跑 JVM 單元測試（./gradlew test）。instrumented test 要模擬器，這裡不跑。
+  android:
+    name: Android 單元測試
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 有沒有動到 Android
+        id: changed
+        uses: dorny/paths-filter@v3
+        with:
+          filters: |
+            android:
+              - 'app/wherebear_app_android/**'
+
+      - uses: actions/setup-java@v4
+        if: steps.changed.outputs.android == 'true'
+        with:
+          distribution: temurin
+          java-version: '21'
+
+      # 沒有 wrapper 就直接讓它紅，並講清楚為什麼——貢獻者最容易漏這個。
+      - name: 檢查 gradle wrapper
+        if: steps.changed.outputs.android == 'true'
+        run: |
+          test -f app/wherebear_app_android/gradlew || {
+            echo "::error::缺少 app/wherebear_app_android/gradlew（gradle wrapper 沒帶上，CI 無法建置）"
+            exit 1
+          }
+
+      - name: gradlew test
+        if: steps.changed.outputs.android == 'true'
+        working-directory: app/wherebear_app_android
+        run: |
+          chmod +x ./gradlew
+          ./gradlew test --no-daemon
