@@ -46,8 +46,14 @@ jobs:
       # 這裡跑的是我們自己 repo 的 .md，沒有不受信任的輸入。
       - name: puppeteer config for mmdc
         run: |
+          # ① 沙箱：CI 容器沒有 user namespace，Chrome 預設沙箱起不來。
           echo '{"args":["--no-sandbox","--disable-setuid-sandbox"]}' > "$HOME/.puppeteerrc.json"
           echo "PUPPETEER_CONFIG=$HOME/.puppeteerrc.json" >> "$GITHUB_ENV"
+          # ② 瀏覽器本體：npm -g 裝 mermaid-cli 時 puppeteer 不一定把 Chrome 下載到
+          #    runner 使用者讀得到的位置。ubuntu runner 映像自帶 Chrome，直接指過去最穩。
+          CHROME="$(command -v google-chrome || command -v chromium-browser || command -v chromium || true)"
+          if [ -z "$CHROME" ]; then npx --yes puppeteer browsers install chrome; else echo "PUPPETEER_EXECUTABLE_PATH=$CHROME" >> "$GITHUB_ENV"; fi
+          echo "chrome=$CHROME"
 
       - name: docs lint
         run: python3 scripts/docs_lint.py
