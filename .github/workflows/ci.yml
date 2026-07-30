@@ -92,6 +92,57 @@ jobs:
             exit 1
           }
 
+      # ── wrapper jar 的兩道驗證 ───────────────────────────────────────────
+      # 為什麼要驗：gradle-wrapper.jar 是一顆「跟著 PR 進來、會被 CI 執行」的二進位檔。
+      # 它不是原始碼，看 diff 看不出內容，而下一步的 ./gradlew test 就是在跑它。
+      # 社群 PR 一旦夾帶動過手腳的 jar，等於在 runner 上任意執行程式碼。
+      # 這兩關把「肉眼看不出來」的部分交給機器，且各自抓不同的東西：
+
+      # ① 是不是 Gradle 官方發布過的 jar（官方 action、比對已知全部版本的 checksum）
+      #    抓得到：被竄改／來路不明的 jar
+      #    抓不到：合法但版本對不上 distributionUrl 的 jar —— 那是下一關的事
+      - name: wrapper jar 是官方發布的
+        if: steps.changed.outputs.android == 'true'
+        uses: gradle/actions/wrapper-validation@v4
+
+      # ② jar 的版本跟 distributionUrl 宣告的一不一致
+      #    `gradle wrapper --gradle-version X` 只改 properties，jar 用的是產生它那台機器
+      #    本機那版 —— 這是 Gradle 的已知行為，很容易在不知情的狀況下把兩者送成不同版本。
+      #    後果是「宣告 8.9、實際用 9.x 的 wrapper 去跑」，一個沒人驗過的組合。
+      #    比對對象直接跟官方要（services.gradle.org 每個版本都發 .sha256），不自己維護清單。
+      - name: wrapper jar 版本與 distributionUrl 一致
+        if: steps.changed.outputs.android == 'true'
+        working-directory: app/wherebear_app_android
+        run: |
+          set -euo pipefail
+          props=gradle/wrapper/gradle-wrapper.properties
+          jar=gradle/wrapper/gradle-wrapper.jar
+
+          ver="$(sed -nE 's#.*gradle-([0-9][0-9.]*)-(bin|all)\.zip.*#\1#p' "$props" | head -1)"
+          if [ -z "$ver" ]; then
+            echo "::error file=$props::讀不出 distributionUrl 的 Gradle 版本（預期形如 gradle-8.9-bin.zip）"
+            exit 1
+          fi
+
+          if ! expected="$(curl -fsSL "https://services.gradle.org/distributions/gradle-${ver}-wrapper.jar.sha256")"; then
+            echo "::error file=$props::向 Gradle 官方查不到 ${ver} 的 wrapper checksum（版本號打錯，或該版本不存在）"
+            exit 1
+          fi
+
+          actual="$(sha256sum "$jar" | cut -d' ' -f1)"
+          if [ "$expected" != "$actual" ]; then
+            echo "::error file=$jar::wrapper jar 與 distributionUrl 宣告的版本不符"
+            echo "  distributionUrl 宣告：Gradle ${ver}"
+            echo "  該版官方 jar sha256 ：${expected}"
+            echo "  這個 PR 帶進來的     ：${actual}"
+            echo ""
+            echo "  修法：在 app/wherebear_app_android/ 底下用該版本重新產生 wrapper，例如"
+            echo "    gradle wrapper --gradle-version ${ver} --distribution-type bin"
+            echo "  然後確認 gradle-wrapper.jar 真的一起變了（只改 properties 不會換 jar）。"
+            exit 1
+          fi
+          echo "✓ wrapper jar 對得上 distributionUrl 宣告的 Gradle ${ver}"
+
       - name: gradlew test
         if: steps.changed.outputs.android == 'true'
         working-directory: app/wherebear_app_android
