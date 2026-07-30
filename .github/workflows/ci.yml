@@ -57,3 +57,44 @@ jobs:
 
       - name: docs lint
         run: python3 scripts/docs_lint.py
+
+  # ─────────────────────────────────────────────────────────────────────────
+  # Android（社群貢獻）。用「有沒有動到那個目錄」決定跑不跑：
+  #   · 目錄還不存在時 → 這個 job 直接 skip，不影響現有綠燈
+  #   · PR 一旦動到 app/wherebear_app_android/** → 自動跑，沒有可跑的測試就是紅的
+  # 只跑 JVM 單元測試（./gradlew test）。instrumented test 要模擬器，這裡不跑。
+  android:
+    name: Android 單元測試
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 有沒有動到 Android
+        id: changed
+        uses: dorny/paths-filter@v3
+        with:
+          filters: |
+            android:
+              - 'app/wherebear_app_android/**'
+
+      - uses: actions/setup-java@v4
+        if: steps.changed.outputs.android == 'true'
+        with:
+          distribution: temurin
+          java-version: '21'
+
+      # 沒有 wrapper 就直接讓它紅，並講清楚為什麼——貢獻者最容易漏這個。
+      - name: 檢查 gradle wrapper
+        if: steps.changed.outputs.android == 'true'
+        run: |
+          test -f app/wherebear_app_android/gradlew || {
+            echo "::error::缺少 app/wherebear_app_android/gradlew（gradle wrapper 沒帶上，CI 無法建置）"
+            exit 1
+          }
+
+      - name: gradlew test
+        if: steps.changed.outputs.android == 'true'
+        working-directory: app/wherebear_app_android
+        run: |
+          chmod +x ./gradlew
+          ./gradlew test --no-daemon
