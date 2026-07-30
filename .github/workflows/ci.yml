@@ -40,5 +40,14 @@ jobs:
           node-version: '20'
       - name: install mermaid-cli
         run: npm i -g @mermaid-js/mermaid-cli
+
+      # mmdc 底下是 puppeteer/Chrome。CI 容器沒有 user namespace，Chrome 的沙箱起不來，
+      # 每張圖都會渲染失敗（本機正常、CI 全紅就是這個）。給它 --no-sandbox 即可；
+      # 這裡跑的是我們自己 repo 的 .md，沒有不受信任的輸入。
+      - name: puppeteer config for mmdc
+        run: |
+          echo '{"args":["--no-sandbox","--disable-setuid-sandbox"]}' > "$HOME/.puppeteerrc.json"
+          echo "PUPPETEER_CONFIG=$HOME/.puppeteerrc.json" >> "$GITHUB_ENV"
+
       - name: docs lint
         run: python3 scripts/docs_lint.py
