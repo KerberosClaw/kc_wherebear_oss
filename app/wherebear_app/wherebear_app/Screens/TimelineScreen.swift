@@ -134,7 +134,10 @@ struct TimelineScreen: View {
                 LandmarkFormSheet(coordinate: existing?.coordinate ?? c,
                                   suggestedName: (stay.isLowConfidence || stay.name == "未命名地點") ? "" : stay.name,
                                   editing: existing,
-                                  onSaved: { _ in reapplyAliases() })   // 命名/改範圍後即時套用（含鄰近點）
+                                  onSaved: { _ in reapplyAliases() },   // 樂觀更新：畫面先跟上
+                                  // 真的落地之後才做人為指定 —— 要拿 server id，也要確保
+                                  // 它跑在自動重判之前（否則感測器可能先定案，人講的話就輸了）
+                                  onPersisted: { saved in assignNamedStay(stay, to: saved) })
             }
         }
         .task {
@@ -164,6 +167,26 @@ struct TimelineScreen: View {
             if let c = vm.todayStays[i].coordinate, let lm = landmarks.resolvePreview(c) {
                 vm.todayStays[i].name = lm.alias
             }
+        }
+    }
+
+    // 使用者對著某一段停留按了命名 —— 那是**人在指認**，不只是畫了一個圓。
+    // 感測器那條路要湊足票數才敢命名（單一定位點在沒有 CLVisit 同名佐證時判錯過，所以門檻是
+    // 兩票），但人講的話不需要湊票。把這個訊號送回後端，那段停留就直接成立。
+    //
+    // 只對 visit 來源的停留有效（live／相片匯入沒有對應的 visit 身分）。
+    // 送不出去也不影響地標已經存好這件事，下次還有「權威離開時重判」那道安全網。
+    private func assignNamedStay(_ stay: Stay, to saved: Landmark?) {
+        guard let visitId = stay.visitId, let lm = saved else {
+            // 沒 visit 身分（live／相片匯入）或地標根本沒存成功 → 沒有可指認的對象。
+            // 仍要補一次重判：表單為了讓指定排在前面，已經把自動重判關掉了。
+            Task { await LandmarkManager.reconsiderRecentVisits() }
+            return
+        }
+        Task {
+            await LandmarkManager.assignVisit(visitId, toLandmark: lm.id)
+            await LandmarkManager.reconsiderRecentVisits()  // 指定完才做廣域重判，順序不能反
+            await vm.reloadStays()                          // 後端定案後刷新，時間軸與事件同源
         }
     }
 

@@ -1,6 +1,6 @@
 # DESIGN — kc_wherebear 後端架構與決策
 
-> **English summary:** Records the rationale behind kc_wherebear's backend design as a numbered set of decisions (D1–D16), including choosing a self-hosted Supabase (BaaS) backend, a native Swift app, Supabase Auth + RLS bound to `auth.uid()` for writes, a read-only Edge Function for headless consumers, and the hot/cold dual-table model (`current_location` upsert + `location_history` append). It also covers the landmark-alias / reverse-geocode resolution layer, the pg_cron archival policy, the privacy stance, an optional Realtime channel for "just arrived at a named place" events (D13), how CLVisit dwells are keyed and fused with GPS-cluster stays so one visit never lands as two rows (D14), and how a stay is closed from two kinds of evidence — a newer arrival, or live positions proving the user is elsewhere (D15). Finally, it records why an event's place name is decided once, by adjudicating the live points around the arrival, with the departure reusing that snapshot — instead of being recomputed at emit time from whatever coordinate the row happens to hold, which made one dwell report two different names (D16).
+> **English summary:** Records the rationale behind kc_wherebear's backend design as a numbered set of decisions (D1–D16), including choosing a self-hosted Supabase (BaaS) backend, a native Swift app, Supabase Auth + RLS bound to `auth.uid()` for writes, a read-only Edge Function for headless consumers, and the hot/cold dual-table model (`current_location` upsert + `location_history` append). It also covers the landmark-alias / reverse-geocode resolution layer, the pg_cron archival policy, the privacy stance, an optional Realtime channel for "just arrived at a named place" events (D13), how CLVisit dwells are keyed and fused with GPS-cluster stays so one visit never lands as two rows (D14), and how a stay is closed from two kinds of evidence — a newer arrival, or live positions proving the user is elsewhere (D15). Finally, it records why an event's place name is decided once, by adjudicating the live points around the arrival, with the departure reusing that snapshot — instead of being recomputed at emit time from whatever coordinate the row happens to hold, which made one dwell report two different names (D16). It also records the decision that an `unresolved` adjudication which has not yet emitted any event is a promotable transient rather than a terminal state, so that naming a place after arriving there can still recover that stay's notifications.
 
 承接需求對齊（grill）的收斂。這份記「為什麼這樣設計」；隨實作演進回填。
 
@@ -26,6 +26,7 @@
 | **D14** | `visits` 唯一鍵＝`(user_id, arrived_at)`（不含座標）；停留段＝「CLVisit 管時間、live 聚合管位置」合併 | CLVisit 同一次停留投遞兩次且座標會漂 → 鍵含座標會生出關不掉的第二列；兩種偵測各對一半，互補不可二選一。見下 |
 | **D15** | 停留段的收尾接受**兩種證據**：新的到達、以及「當前位置持續在別處」的反證 | CLVisit 的離開投遞會遺失（app 被系統回收），且它對短距離移動不發新到達（實測 209 公尺、兩個半小時都沒有）→ 只等它給離開，停留會永遠開著 |
 | **D16** | 事件的地名改由**裁決**產生：一段停留只裁決一次、以 live 點群為證據、證據不足就不發具名事件；離開沿用到達的裁決結果 | 現行「發射當下用該列座標即時計算」讓同一段停留前後解出兩個名字（實例見下）。讀取層早已是「CLVisit 管時間、live 管位置與名稱」（D14），事件層沒沿用 → 同一系統兩套真相。**已實作並上線**（`20260727000004_visit_event_adjudication.sql`），見下 |
+| **D17** | 「尚未送出任何事件的 `unresolved`」是**可晉升的暫態**，不是終態：地標建立、權威離開、使用者指認都能讓它重新被考慮一次，但只能往 `resolved` 走 | D16 讓一段停留只裁決一次，代價是「先到新地方、再把它加成地標」這個最自然的順序會讓該段永遠拿不到推播——裁決在地標出生之前就跑完了。讀取層每次查詢都用當下的地標表重算，於是時間軸看得到地名、推播卻沒有：同一系統又出現兩套真相，只是這次分在時間軸上。**已實作並上線**，見下 |
 
 > 註：D11（`landmarks` 自訂地標 alias）、D12（alias 命中免打外部 geocode）已在 migrations／`API_CONTRACT.md` 引用、尚未回填本表；本篇順序取 D13。
 
@@ -205,6 +206,46 @@ visits INSERT/UPDATE ──► 觸發器（資料庫端）
 - **R4 邊界不變**：兩讀口一律走 read-only Edge Function（A 模式：service_role owner-scope）→ bridge 寫本地檔 → 下游只讀本地檔（D9）。
 
 **待調（spike，非現在拍板）**：停留段偵測（半徑 + 最短停留 + gap）拿真實資料調；stays 品質隨 history 累積 + 調參才成熟，`confidence` 欄承接初期粗糙。
+
+### D17 未送出的 unresolved ＝ 可晉升的暫態
+
+**狀態規則**
+
+| 狀態 | 可否重新考慮 |
+|---|---|
+| `resolved` | 終態 |
+| 任一 `*_sent_at` 非 null | 終態——已對外宣告過，收不回 |
+| `unresolved` 且兩個旗標都空 | **可重新考慮，但只能晉升成 `resolved`** |
+
+**三個觸發點**：使用者存完地標後由 app 另開請求呼叫 RPC、權威離開（`ios_clvisit`）到來時的
+自動安全網、以及使用者對著某段停留明確指認地標。前兩者走既有的感測器規則（門檻不放寬），
+第三者是人為指定——人類標註優先於感測器推論，不需要湊足票數。
+
+**counterfactual 而非政策升版**：重判鎖住該裁決當初的 `policy_version`，問的是
+「如果當時這個地標已經存在，原本的規則會怎麼判」。若順手套用新門檻，翻案結果會同時受
+地標與政策兩個變數影響，事後說不清是誰造成的。政策升版必須是獨立、可查、明確指定目標版本的動作。
+
+**補發的兩道界線**
+
+- 年齡上限（`emit_horizon_s`）：`arrival` 看 `arrived_at`、`departure` 看 `departed_at`。
+  過期就不進即時通道，**且不寫 `*_sent_at`**——假寫會讓日後真的該發時被冪等旗標擋掉。
+  下游會把過期事件丟棄但水位照樣推進，補一則陳年事件不只零效益，還可能把同批有效事件一起跨過去。
+- 只補一則有意義的：已結束的停留只補離開、還開著的只補到達。同批補兩則會推出
+  「他剛到了 X」＋「他剛離開 X」這種矛盾組合。
+
+**刻意不做**
+
+- 不在 `landmarks` 掛同步觸發器。那會把地標存檔綁進事件管線——重判、搶旗標、寫即時訊息
+  全在同一筆交易裡，任何一段失敗使用者看到的會是「地標存不了」，實際原因卻可能只是
+  事件基礎設施出問題。
+- 不把 `unresolved` 重設回 `pending`。那會讓排程、重判、離開觸發器三邊同時取得處理資格，
+  也毀掉稽核語意。改成 `unresolved → resolved` 的原子比較並設定。
+- 不放寬共識門檻。單一未受佐證的定位點判錯過（回放中有一筆走路途中的點，會把 A 判成 B），
+  放寬等於拿「少漏幾則」換「很有把握地說錯地方」——漏報只是安靜，誤報是信任問題。
+- 不讓精度寬容用在證據側。寬容是 `radius + accuracy` 且沒有上限，單獨採信會擴到隔壁地標。
+
+**稽核**：`visit_decision_revisions` append-only 記錄每一次裁決，含觸發來源與版本；
+初次的 `decided_at` 與 `legacy_would_emit` 永不覆寫——它們解釋的正是「當初為何沒發」。
 
 ## 平台能力對照（已對 Supabase 官方 docs 坐實）
 

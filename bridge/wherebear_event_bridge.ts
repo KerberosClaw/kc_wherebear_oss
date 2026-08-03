@@ -109,6 +109,19 @@ function judgeEnv(): Record<string, string> {
     PATH: ENV("PATH"),
     HOME: ENV("HOME"),
     LANG: ENV("LANG", "en_US.UTF-8"),
+    // 🔴 USER 屬於「基本執行環境」，不是下游專屬設定 —— 少了它，下游在 macOS 上刷不到
+    // Keychain 裡的憑證。實測：下游的 CLI 噴
+    //   `Failed to authenticate: OAuth session expired and could not be refreshed`
+    // 而同一支 CLI 在完整環境下同樣旗標跑起來是正常的。剝光環境後逐一加回做二分，
+    // 確認是**單一變數**：只補 USER 就好，SECURITYSESSIONID / TMPDIR / LOGNAME 都不是。
+    //
+    // ⚠️ 這個缺口的形狀很賊：token 還沒過期時讀得到、**要刷新的時候才需要寫 Keychain**，
+    // 那時才卡住。所以它表現成「跑了好一陣子，某天之後突然不再送」，而不是「一開始就壞」——
+    // 從外面看很像迴歸，其實是從寫下這段白名單那一刻就存在的洞。
+    //
+    // 為什麼不丟進 WHEREBEAR_EVENT_JUDGE_ENV_PREFIXES：那份清單的語意是「下游專屬設定」，
+    // USER 是通用執行環境。塞進去等於每接一個新消費者都要重新補一次同樣的東西。
+    USER: ENV("USER"),
   };
   if (PASS_PREFIXES.length) {
     for (const [k, v] of Object.entries(Deno.env.toObject())) {

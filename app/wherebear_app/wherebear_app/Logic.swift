@@ -112,6 +112,8 @@ final class LocationDelegate: NSObject, CLLocationManagerDelegate {
     @ObservationIgnored private let outboxCap = 1000          // 上限、避免無限成長
     @ObservationIgnored private let visitOutboxKey = "wb_visit_outbox"  // 離線/連不到期間累積的 CLVisit 停留；回線補送（原本 try? 會靜默丟）
     @ObservationIgnored private let visitOutboxCap = 500
+    @ObservationIgnored private let visitLogKey = "wb_visit_log"        // 停留診斷紀錄（見 §停留診斷紀錄）
+    @ObservationIgnored private let visitLogCap = 80
     @ObservationIgnored private let reportingKey = "wb_reporting"       // 回報開關要跨啟動記住（見 init 的自動恢復）
     @ObservationIgnored private var lastReportedFix: (lat: Double, lng: Double, at: Date, accuracy: Double)?  // 見 isRedundantFix：擋同一次定位被兩條觸發源各寫一列
     @ObservationIgnored private let fixDedupWindow: TimeInterval = 2     // 同座標且此秒數內＝同一次定位（實測重複投遞相距 0.06～0.6 秒）
@@ -123,6 +125,7 @@ final class LocationDelegate: NSObject, CLLocationManagerDelegate {
         permissionState = LocationReporter.map(manager.authorizationStatus)
         outboxCount = loadOutbox().count            // 啟動時同步既有佇列筆數
         visitOutboxCount = loadVisitOutbox().count  // 停留佇列同理（app 更新後可能還躺著待補送的停留）
+        visitLogCount = visitLogPeek().count        // 診斷紀錄跨啟動保留（要看的正是「上次冷啟動那一刻」）
         delegate.onAuth = { [weak self] status in
             Task { @MainActor in
                 guard let self else { return }
@@ -177,6 +180,9 @@ final class LocationDelegate: NSObject, CLLocationManagerDelegate {
         configureBackgroundUpdates()
         manager.startMonitoringSignificantLocationChanges()  // 背景/終止後 iOS 仍可喚醒送點（需 Always + 背景能力）
         manager.startMonitoringVisits()                      // CLVisit：低耗電背景偵測靜止長停留（在家/公司不動）
+        // 每次註冊都留一行：iOS 只會把停留交給「有註冊」的 app，而註冊只在這裡發生。
+        // 冷啟動有沒有走到這裡，是「iPhone 沒送」與「我們沒在聽」的第一個分岔。
+        appendVisitLog("🟢 已註冊停留監控　定位權限 \(manager.authorizationStatus == .authorizedAlways ? "永遠" : "非永遠")")
         requestOnce()   // 已授權才取；未授權等 onAuth 再補
         startPolling()
     }
@@ -337,7 +343,18 @@ final class LocationDelegate: NSObject, CLLocationManagerDelegate {
     // 🔴 鍵不含座標：iOS 兩次投遞的 coordinate 會漂（實測差 33～205 m），含座標會 INSERT 出關不掉的第二列（見 D14）。
     // accuracy 一併上傳：那是 CLVisit 自報的誤差，後端拿它放寬 landmark alias 比對半徑。
     private func recordVisit(_ visit: CLVisit) async {
-        guard let uid = WBAuth.shared.userId, visit.arrivalDate != .distantPast else { return }
+        // 🔴 紀錄寫在 guard **之前**：這道 guard 會把停留直接丟掉（不進佇列、不重試），
+        // 而那正是我們最需要看見的一刻——iOS 為了定位事件冷啟動 app 時，登入憑證要走一趟
+        // 網路才會回來，那一兩秒內進來的停留會無聲蒸發。寫在 guard 後面就永遠看不到它。
+        let signedIn = WBAuth.shared.userId != nil
+        let arrTxt = visit.arrivalDate == .distantPast ? "無" : WBLogTime.text(visit.arrivalDate)
+        let depTxt = visit.departureDate == .distantFuture ? "尚未離開" : WBLogTime.text(visit.departureDate)
+        appendVisitLog("📍 收到停留　到達 \(arrTxt)　離開 \(depTxt)　登入\(signedIn ? "已就緒" : "🔴 未就緒")")
+
+        guard let uid = WBAuth.shared.userId, visit.arrivalDate != .distantPast else {
+            appendVisitLog(signedIn ? "🔴 丟棄：到達時刻無效" : "🔴 丟棄：登入未就緒（不進佇列、不重試）")
+            return
+        }
         let iso = ISO8601DateFormatter(); iso.formatOptions = [.withInternetDateTime]
         var body: [String: Any] = ["user_id": uid,
                                    "lat": visit.coordinate.latitude, "lng": visit.coordinate.longitude,
@@ -352,8 +369,10 @@ final class LocationDelegate: NSObject, CLLocationManagerDelegate {
     func submitVisit(_ body: [String: Any]) async {
         do {
             try await postVisit(body)
+            appendVisitLog("✅ 已送出　到達 \(WBLogTime.text(iso: body["arrived_at"] as? String))")
             await flushVisitOutbox()
         } catch {
+            appendVisitLog("⚠️ 送出失敗 → 進佇列　到達 \(WBLogTime.text(iso: body["arrived_at"] as? String))")
             enqueueVisit(body)
         }
     }
@@ -442,6 +461,33 @@ final class LocationDelegate: NSObject, CLLocationManagerDelegate {
             guard let la = b["lat"] as? Double, let lo = b["lng"] as? Double else { return nil }
             return ((b["arrived_at"] as? String) ?? "", b["departed_at"] as? String, la, lo)
         }
+    }
+
+    // MARK: - 停留診斷紀錄（設定頁「離線佇列 → 紀錄」）
+    //
+    // 為什麼需要：實測曾有一整天沒交出任何 CLVisit —— 而「手機根本沒送」與
+    // 「送了但被我們丟掉」這兩件事，從外面看**一模一樣**（佇列 0 ＋ 資料庫沒有 ＋ 沒有任何錯誤）。
+    // 分不開就只能猜。這份紀錄把那一刻的讀數留下來：有沒有收到、收到時登入好了沒、送出結果如何。
+    //
+    // 🔴 刻意寫在手機本機（UserDefaults）而不是送回後端：要診斷的失效情境本身就包含
+    //    「沒網路」與「還沒登入」，把讀數送去要網路要登入的地方等於白做。
+    // 🔴 刻意不寫座標：這份紀錄會被截圖貼出來，只留時刻與狀態就夠判斷。
+    private(set) var visitLogCount = 0
+
+    func visitLogPeek() -> [String] { UserDefaults.standard.stringArray(forKey: visitLogKey) ?? [] }
+
+    func clearVisitLog() {
+        UserDefaults.standard.removeObject(forKey: visitLogKey)
+        visitLogCount = 0
+    }
+
+    // internal：測試可直接餵字串、免造 CLVisit（同 submitVisit，CLVisit 無公開 init）
+    func appendVisitLog(_ line: String) {
+        var q = visitLogPeek()
+        q.append("\(WBLogTime.text(Date()))\t\(line)")
+        if q.count > visitLogCap { q.removeFirst(q.count - visitLogCap) }
+        visitLogCount = q.count
+        UserDefaults.standard.set(q, forKey: visitLogKey)
     }
 
     static func map(_ s: CLAuthorizationStatus) -> PermissionState {
@@ -591,7 +637,8 @@ final class LocationDelegate: NSObject, CLLocationManagerDelegate {
              dwellSeconds: (r["dwell_seconds"] as? Int) ?? 0,
              confidence: (r["confidence"] as? Double) ?? 1,
              source: parseSource(r["source"] as? String),
-             coordinate: coord(r))
+             coordinate: coord(r),
+             visitId: r["visit_id"] as? Int)
     }
 
     private static func parseSource(_ s: String?) -> Stay.Source {
@@ -802,35 +849,57 @@ final class LocationDelegate: NSObject, CLLocationManagerDelegate {
 
     // create/update/delete：樂觀改 → await 結果 → 失敗（離線/連不到）還原本地 + lastError 提示（不再靜默吞錯，UI 不說謊）
     func create(alias: String, coordinate: CLLocationCoordinate2D, radius: Int) {
-        guard let uid = WBAuth.shared.userId else { return }
+        Task { _ = await createAndWait(alias: alias, coordinate: coordinate, radius: radius) }
+    }
+
+    // 存好之後才回傳（含 server id）。
+    //
+    // 🔴 為什麼需要「等得到」的版本：原本的 create 是射後不理——呼叫端拿不到落地時機，
+    //    也拿不到 server id。時間軸命名那條路要在存好之後把「我指的就是這一段」送回去，
+    //    用射後不理的版本會撞兩個競態：POST 還沒提交就先 load()（新地標不在清單裡，
+    //    指定悄悄消失），以及自動重判先把裁決定案掉（人講的話反而輸給感測器推論）。
+    //
+    // reconsider=false 時不自動重判，交給呼叫端在做完人為指定之後自己觸發——
+    // 順序很重要：人為指定要先，否則感測器可能先定案、之後就不接受了。
+    @discardableResult
+    func createAndWait(alias: String, coordinate: CLLocationCoordinate2D, radius: Int,
+                       reconsider: Bool = true) async -> Landmark? {
+        guard let uid = WBAuth.shared.userId else { return nil }
         let new = Landmark(id: UUID().uuidString, alias: alias, coordinate: coordinate, radius: radius)
         landmarks.append(new)
-        Task {
-            do {
-                try await WBClient.rest("POST", table: "landmarks",
-                    body: ["user_id": uid, "alias": alias, "lat": coordinate.latitude, "lng": coordinate.longitude, "radius": radius])
-                await load()   // 成功才重載同步（拿 server id）
-            } catch {
-                landmarks.removeAll { $0.id == new.id }
-                lastError = "地標沒建立成功——沒網路或連不到伺服器。"
-            }
+        do {
+            try await WBClient.rest("POST", table: "landmarks",
+                body: ["user_id": uid, "alias": alias, "lat": coordinate.latitude, "lng": coordinate.longitude, "radius": radius])
+            await load()   // 成功才重載同步（拿 server id）
+            if reconsider { await Self.reconsiderRecentVisits() }
+            return Self.nearestContaining(coordinate, in: landmarks)
+        } catch {
+            landmarks.removeAll { $0.id == new.id }
+            lastError = "地標沒建立成功——沒網路或連不到伺服器。"
+            return nil
         }
     }
 
     func update(_ landmark: Landmark) {
-        guard let i = landmarks.firstIndex(where: { $0.id == landmark.id }) else { return }
+        Task { _ = await updateAndWait(landmark) }
+    }
+
+    @discardableResult
+    func updateAndWait(_ landmark: Landmark, reconsider: Bool = true) async -> Landmark? {
+        guard let i = landmarks.firstIndex(where: { $0.id == landmark.id }) else { return nil }
         let old = landmarks[i]
         landmarks[i] = landmark
-        Task {
-            do {
-                try await WBClient.rest("PATCH", table: "landmarks",
-                    query: [URLQueryItem(name: "id", value: "eq.\(landmark.id)")],
-                    body: ["alias": landmark.alias, "lat": landmark.coordinate.latitude,
-                           "lng": landmark.coordinate.longitude, "radius": landmark.radius])
-            } catch {
-                if let j = landmarks.firstIndex(where: { $0.id == landmark.id }) { landmarks[j] = old }
-                lastError = "地標沒更新成功——沒網路或連不到伺服器。"
-            }
+        do {
+            try await WBClient.rest("PATCH", table: "landmarks",
+                query: [URLQueryItem(name: "id", value: "eq.\(landmark.id)")],
+                body: ["alias": landmark.alias, "lat": landmark.coordinate.latitude,
+                       "lng": landmark.coordinate.longitude, "radius": landmark.radius])
+            if reconsider { await Self.reconsiderRecentVisits() }
+            return landmark
+        } catch {
+            if let j = landmarks.firstIndex(where: { $0.id == landmark.id }) { landmarks[j] = old }
+            lastError = "地標沒更新成功——沒網路或連不到伺服器。"
+            return nil
         }
     }
 
@@ -847,11 +916,56 @@ final class LocationDelegate: NSObject, CLLocationManagerDelegate {
         }
     }
 
+    // 存完地標之後請後端把「當初判不出名字、又還沒發過事件」的停留重新考慮一次。
+    //
+    // 🔴 刻意獨立成一個請求、而且吞掉錯誤：後端沒有把這件事做成 landmarks 上的觸發器，
+    //    否則重判、搶旗標、寫即時訊息會全綁在同一筆交易裡 —— 任何一段失敗，使用者看到的
+    //    會是「地標存不了」，實際原因卻可能只是事件基礎設施出問題。地標存檔的成敗
+    //    不該被這件事影響；這支冪等、可重試，漏跑一次還有「權威離開時重判」那道安全網。
+    static func reconsiderRecentVisits() async {
+        _ = try? await WBClient.rpc("my_reconsider_recent_visits")
+    }
+
+    // 使用者對著某一段停留指認地標。人類標註優先於感測器推論，不需要湊足票數。
+    // 回傳後端的處置字串（assigned / already_resolved / already_announced / …），nil = 呼叫失敗。
+    @discardableResult
+    static func assignVisit(_ visitId: Int, toLandmark landmarkId: String) async -> String? {
+        guard let lid = Int(landmarkId) else { return nil }
+        guard let data = try? await WBClient.rpc("assign_visit_landmark",
+                                                 params: ["p_visit_id": visitId, "p_landmark_id": lid])
+        else { return nil }
+        return String(data: data, encoding: .utf8)?
+            .trimmingCharacters(in: CharacterSet(charactersIn: "\"\n "))
+    }
+
+    // 圈得到這個點的地標裡挑「最近的」（同距離取半徑較小者）—— 與後端 resolve_alias
+    // (`20260723000007_resolve_alias.sql`) 的 `order by st_distance asc, radius asc limit 1` 同一套規則。
+    //
+    // 🔴 不可以改回 `first`。`first` 挑的是「陣列裡第一個圈到它的」，與遠近無關；而那個陣列來自
+    // 一支沒有 order by 的查詢（見 load()），順序連保證都沒有。兩個地標的圈一旦重疊，落在重疊區的
+    // 點在這裡挑到的地標就會與後端解出來的名字不同。
+    //
+    // 實測：一組半徑 170 與 100 的地標，圓心只距 237 公尺 → 兩圈疊了 33 公尺。
+    // 一段停留的中心正好落進重疊區，於是時間軸顯示後端挑的「較近那個」，點下去要編輯時這裡卻挑到
+    // 「陣列裡較前面那個」—— 使用者以為在編輯 A、實際改到 B，而編輯的第一件事往往是把半徑拉大，
+    // 一拉大重疊就更嚴重。三個呼叫端全吃這條規則：時間軸命名（開編輯既有地標）、命名後就地重掃
+    // 地名、新增地標時的重疊提示，三者都會一起偏掉。
+    static func nearestContaining(_ c: CLLocationCoordinate2D, in list: [Landmark]) -> Landmark? {
+        let here = CLLocation(latitude: c.latitude, longitude: c.longitude)
+        return list
+            .compactMap { l -> (landmark: Landmark, distance: CLLocationDistance)? in
+                let d = CLLocation(latitude: l.coordinate.latitude, longitude: l.coordinate.longitude)
+                    .distance(from: here)
+                return d <= Double(l.radius) ? (l, d) : nil
+            }
+            .min { a, b in
+                a.distance == b.distance ? a.landmark.radius < b.landmark.radius : a.distance < b.distance
+            }?
+            .landmark
+    }
+
     func resolvePreview(_ c: CLLocationCoordinate2D) -> Landmark? {
-        landmarks.first { l in
-            CLLocation(latitude: l.coordinate.latitude, longitude: l.coordinate.longitude)
-                .distance(from: CLLocation(latitude: c.latitude, longitude: c.longitude)) <= Double(l.radius)
-        }
+        Self.nearestContaining(c, in: landmarks)
     }
 
     func dismissLongStay() { pendingLongStay = nil }

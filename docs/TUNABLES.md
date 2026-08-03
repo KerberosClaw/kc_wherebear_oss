@@ -1,6 +1,6 @@
 # TUNABLES — 可調參數速查
 
-> **English summary:** A quick-reference for kc_wherebear's tunable behavior parameters and where each one lives in the source. It lists the stay-detection thresholds (minimum dwell, cluster radius, gap), the app's location-report frequencies and desired accuracy for saver/standard modes, the bridge daemon's poll interval, and the geocode cache's coordinate-rounding precision. It also covers the core-window union used when fusing a CLVisit dwell with a GPS cluster, and the app-side dedup window that drops a location fix delivered twice by two triggers. It records current values only — to change a parameter, edit it at its source.
+> **English summary:** A quick-reference for kc_wherebear's tunable behavior parameters and where each one lives in the source. It lists the stay-detection thresholds (minimum dwell, cluster radius, gap), the app's location-report frequencies and desired accuracy for saver/standard modes, the bridge daemon's poll interval, and the geocode cache's coordinate-rounding precision. It also covers the core-window union used when fusing a CLVisit dwell with a GPS cluster, and the app-side dedup window that drops a location fix delivered twice by two triggers. It also documents the versioned place-name adjudication policy — evidence-window bounds, the two vote thresholds, the live-fix accuracy cutoff, and the age limit past which an event is no longer pushed to the realtime channel. It records current values only — to change a parameter, edit it at its source.
 
 > 「行為門檻／頻率」類參數的單一速查。**問參數先看這、免撈 code。** 本檔只記現值＋來源位置；要改請改對應來源。
 > 🔴 born-clean：本檔只有通用參數，無座標／金鑰／身分。
@@ -84,6 +84,23 @@ app 走 `my_today_stays` / `my_stays_range` / `my_stays_days`，皆用上述**�
 | 誤差加成 | 停留誤差 ＋ 當前定位誤差 ＋ 100 公尺 | 兩邊定位都爛時自動放寬 |
 
 實際門檻＝三者取大。🔴 **不要改回寫死常數**：第一版寫死 250 公尺，剛好擋不住當初要修的 209 公尺實例。
+
+## 事件地名裁決 `visit_event_policies`（版本化；調參＝新增一列並切換 active，**不可原地改**）
+
+原地改會讓歷史事件無法重現當初的判準。門檻是拿既有停留做唯讀回放校準出來的，不是拍腦袋。
+
+| 參數 | 現值 | 意義 |
+|---|---|---|
+| `pre_window_s` | 120 秒 | 命名證據窗的上緣：到達前多久的定位點也算數 |
+| `post_window_s` | 300 秒 | 證據窗的下緣：到達後多久之內。**不隨停留長短延長** —— 到達五分鐘時還不知道最終待多久，而全域放長會直接延後所有正常的到達通知 |
+| `min_agree_points` | 1 | CLVisit 座標已經判出名字時，只要**一個**嚴格定位點同名就成立（兩個不同來源互相印證） |
+| `min_consensus_points` | 2 | CLVisit 沒答案或與定位點不同名時，定位點必須自己湊到**兩票**。🔴 **不要調成 1**：回放中出現過「窗內只有一筆定位點、而那筆是走路途中的點」→ 把 A 判成隔壁的 B。漏報只是安靜，誤報是信任問題 |
+| `max_live_accuracy_m` | 100 公尺 | 誤差大於此的定位點不採信 |
+| `emit_horizon_s` | **1500 秒（25 分鐘）** | 事件可進即時通道的年齡上限。`arrival` 看 `arrived_at`、`departure` 看 `departed_at`。刻意小於消費端的新鮮度門檻，留傳遞餘裕。過期＝不送，且**不寫 `*_sent_at`**（假寫會讓日後真的該發時被冪等擋掉） |
+
+**精度寬容的不對稱是刻意的**：`resolve_alias` 的四參數形式把半徑放寬成 `radius + accuracy`
+且**沒有上限**，只用在「停留自身座標」這一側去提出候選；證據點那側一律嚴格（寬容 0）。
+粗座標單獨命中不足以命名 —— 放寬到隔壁地標時，它會很有把握地指向錯的那個。
 
 ## 地名快取 `geocode_cache`
 
