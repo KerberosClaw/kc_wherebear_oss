@@ -10,6 +10,10 @@ struct LandmarkFormSheet: View {
     var suggestedName: String = ""
     var editing: Landmark? = nil
     var onSaved: (String) -> Void = { _ in }   // 存好回報名稱 → 呼叫端即時刷新（免等重載）
+    // 🔴 真的落地之後才回報（含 server id）。onSaved 是樂觀更新、在 POST 還沒提交前就會觸發，
+    //    需要拿 server id 或需要「存好之後再做下一件事」的呼叫端一律用這個，不要用 onSaved。
+    //    設了它就代表呼叫端要接手 → 表單不會自動觸發重判，由呼叫端排順序。
+    var onPersisted: ((Landmark?) -> Void)? = nil
 
     @State private var alias = ""
     @State private var preset: RadiusPreset = .place
@@ -76,17 +80,24 @@ struct LandmarkFormSheet: View {
 
             PrimaryButton(title: "儲存") {
                 let name = alias.trimmingCharacters(in: .whitespaces)
-                let finalName: String
-                if var l = editing {
-                    finalName = name.isEmpty ? l.alias : name
-                    l.alias = finalName
-                    l.radius = radius
-                    manager.update(l)
-                } else {
-                    finalName = name.isEmpty ? "未命名" : name
-                    manager.create(alias: finalName, coordinate: coordinate, radius: radius)
+                let finalName = editing.map { name.isEmpty ? $0.alias : name }
+                              ?? (name.isEmpty ? "未命名" : name)
+                let willAssign = onPersisted != nil     // 呼叫端要接手 → 先別自動重判，順序見下
+
+                Task {
+                    let saved: Landmark?
+                    if var l = editing {
+                        l.alias = finalName
+                        l.radius = radius
+                        saved = await manager.updateAndWait(l, reconsider: !willAssign)
+                    } else {
+                        saved = await manager.createAndWait(alias: finalName, coordinate: coordinate,
+                                                            radius: radius, reconsider: !willAssign)
+                    }
+                    onPersisted?(saved)
                 }
-                onSaved(finalName)
+
+                onSaved(finalName)   // 樂觀更新：畫面先跟上，不等網路
                 dismiss()
             }
             Spacer(minLength: 0)

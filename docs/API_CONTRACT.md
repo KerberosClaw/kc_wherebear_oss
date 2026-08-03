@@ -1,6 +1,6 @@
 # API_CONTRACT — kc_wherebear 介面 SSOT
 
-> **English summary:** This is the single source of truth for kc_wherebear's interface contract. It defines the two authentication planes — the owner plane over Supabase PostgREST guarded by RLS, and the headless read plane over Edge Functions authenticated with a `wb_`-prefixed API key — along with the request/response payloads for every table and read endpoint. It also specifies the `resolved_name` resolution order (user alias > geocode cache > reverse-geocode > null), the timestamp/unit/timezone conventions, the error shapes and status codes, and the bridge's local JSON schema consumed by downstream readers. On the realtime event channel, `schema_version` is versioned **per `kind`** rather than globally — consumers must branch on `kind` first, then on version — and alongside `arrival`/`departure` there is a `coverage_ended` event that declares "we stopped observing", which is deliberately *not* a claim that the user left anywhere.
+> **English summary:** This is the single source of truth for kc_wherebear's interface contract. It defines the two authentication planes — the owner plane over Supabase PostgREST guarded by RLS, and the headless read plane over Edge Functions authenticated with a `wb_`-prefixed API key — along with the request/response payloads for every table and read endpoint. It also specifies the `resolved_name` resolution order (user alias > geocode cache > reverse-geocode > null), the timestamp/unit/timezone conventions, the error shapes and status codes, and the bridge's local JSON schema consumed by downstream readers. On the realtime event channel, `schema_version` is versioned **per `kind`** rather than globally — consumers must branch on `kind` first, then on version — and alongside `arrival`/`departure` there is a `coverage_ended` event that declares "we stopped observing", which is deliberately *not* a claim that the user left anywhere. It also specifies the two app-plane RPCs for reconsidering an unresolved adjudication and for letting the user explicitly assign a stay to a landmark, together with the age limit past which a backfilled event is no longer pushed.
 
 > 這份是**介面契約單一真相源**。7 支 spec 的 machine-checkable AC 都掛這份 —— 任何 endpoint / payload / 錯誤形狀改動先改這裡，再改 spec，避免多消費者（app / bridge / 下游消費者）介面漂移。
 > 對齊：DESIGN D1–D12、REQUIREMENT R1–R4。🔴 **born-clean**：本檔所有座標 / 金鑰 / 時間全是佔位示意值（null-island `0.0`、`wb_xxxx`），無真值。
@@ -145,7 +145,8 @@ Edge Function：取 header key → `sha256` → 查 `api_keys` where `key_hash=`
 // 今天無點 → stays: []（非 404）
 ```
 - server 端把 raw 點聚成停留段（stay-point detection；半徑/最短停留/gap 參數 spike 調）；**下游只吃「面」、不碰 raw 點**。
-- **多日（app 端）**：app JWT 平面 RPC —— `my_stays_days(p_days date[], p_tz)`（**任意多天、可不連續**，行事曆多選用、上限 31 天）＋ `my_stays_range(p_from, p_to, p_tz)`（連續區間、上限 32 天）。回 `[{day, name, from, to, dwell, centroid_lat, centroid_lng, confidence, source}]`（同 stay 形狀＋`day` 欄）、`auth.uid()` scope。單日仍用 `my_today_stays(p_day, p_tz)`（回 `{name, from, to, dwell, centroid_lat, centroid_lng, confidence, source}`）。（headless 讀口 `/today-stays` 目前仍單日；下游要範圍再另議。）
+- **多日（app 端）**：app JWT 平面 RPC —— `my_stays_days(p_days date[], p_tz)`（**任意多天、可不連續**，行事曆多選用、上限 31 天）＋ `my_stays_range(p_from, p_to, p_tz)`（連續區間、上限 32 天）。回 `[{day, name, from, to, dwell, centroid_lat, centroid_lng, confidence, source, visit_id}]`（同 stay 形狀＋`day` 欄）、`auth.uid()` scope。單日仍用 `my_today_stays(p_day, p_tz)`（回 `{name, from, to, dwell, centroid_lat, centroid_lng, confidence, source, visit_id}`）。
+  - `visit_id`：這一段停留在後端的身分，供消費端說出「我指的就是這一段」（人為指定用，見 §2.4）。`live` / `photo_import` 來源沒有對應的 visit，為 `null`。**純新增欄位**，既有消費端按 key 取值不受影響。（headless 讀口 `/today-stays` 目前仍單日；下游要範圍再另議。）
 - **`source`（app 平面三口專有，migration 11、D14 擴充）**：`"live"`＝實時回報聚出的**停留段**；`"visit"`＝`CLVisit` 靜止停留（時間邊界較準，位置／名稱已與重疊的 live 段合併）；`"photo_import"`＝相簿匯入的**個別點**（`to=null`、`dwell=0`、`confidence=1`）。app 端據此在時間軸／地圖以相機 icon 標匯入點、其餘顯示編號。
 - **headless `/today-stays`（D14 起）**：改吃 `stays_for_day`（`visit` ＋ `live` 合併），**仍濾掉 `photo_import`** → 下游只吃「面」不變、回應形狀不變（無 `source` 欄）。改前只吃 `detect_stays`，久坐不動的長停留在下游會縮成碎片（實測一段 11 小時 32 分的停留，下游只看到 11 分）。
 
@@ -169,6 +170,32 @@ Edge Function：取 header key → `sha256` → 查 `api_keys` where `key_hash=`
 - 消費端**只存在記憶體、不落檔**，到期前自行重換。
 
 ---
+
+### 2.4 裁決重新考慮與人為指定（app JWT 平面 RPC）
+
+地名裁決原本是「一次定案、永不重看」。使用者「先到新地方、再把它加成地標」這個最自然的
+操作順序，會讓那一段停留永遠拿不到推播 —— 裁決在地標出生之前就跑完了。下面兩支把
+「尚未送出任何事件的 `unresolved`」定義成**可晉升的暫態**（只能往 `resolved` 走，不能倒退）。
+
+| RPC | 參數 | 回傳 | 說明 |
+|---|---|---|---|
+| `my_reconsider_recent_visits()` | 無 | `integer`（晉升筆數）| app 在地標存檔**成功之後**另開一個請求呼叫。冪等、可重試、失敗不影響地標已經存好。**不接受任何 user 參數**，只認 `auth.uid()`。 |
+| `assign_visit_landmark(p_visit_id, p_landmark_id)` | 停留 id ＋ 地標 id | `text` 處置字串 | 使用者對著某一段停留指認地標。人類標註優先於感測器推論，不需要湊足票數。兩個 id 都必須屬於呼叫者本人。 |
+
+`assign_visit_landmark` 的處置字串：`assigned`（成功）／`already_resolved`（已定案，不覆寫）／
+`already_announced`（已對外發過事件，收不回）／`no_decision`／`race_lost`。
+
+**刻意不做**：不在 `landmarks` 上掛同步觸發器。那會把地標存檔綁進事件管線 —— 重判、搶旗標、
+寫即時訊息全在同一筆交易裡，任何一段失敗使用者看到的會是「地標存不了」。
+
+**安全網**：權威離開（`departure_source = ios_clvisit`）到來時，後端會對仍 `unresolved`
+且未送出的那段自動重判一次。所以就算 app 沒呼叫上面的 RPC（舊版、離線、從地圖建地標），
+離開的時候通常也補得回來。
+
+**補發的年齡上限**：`visit_event_policies.emit_horizon_s`（預設 1500 秒）。`arrival` 看
+`arrived_at`、`departure` 看 `departed_at`。過期就**不進即時通道，而且不寫 `*_sent_at`** ——
+假寫會讓日後真的該發時被冪等旗標擋掉。過期的段仍會修好時間軸上的地名，只是不推播。
+消費端多半自己也有新鮮度門檻，這條刻意設得比它小、留傳遞餘裕。
 
 ## 3. `resolved_name` 解析規則（R1/R2 共用）
 

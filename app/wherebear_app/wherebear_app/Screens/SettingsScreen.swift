@@ -261,13 +261,14 @@ private struct OutboxDebugScreen: View {
     @State private var tab = 0
     @State private var points: [(lat: Double, lng: Double, at: String)] = []
     @State private var visits: [(arrived: String, departed: String?, lat: Double, lng: Double)] = []
+    @State private var logs: [String] = []
 
     var body: some View {
         VStack(spacing: 0) {
-            DateChips(items: ["地點 (\(points.count))", "停留 (\(visits.count))"], selected: $tab)
+            DateChips(items: ["地點 (\(points.count))", "停留 (\(visits.count))", "紀錄 (\(logs.count))"], selected: $tab)
                 .padding(.top, 8).padding(.bottom, 12)
             List {
-                if tab == 0 { pointRows } else { visitRows }
+                if tab == 0 { pointRows } else if tab == 1 { visitRows } else { logRows }
             }
             .scrollContentBackground(.hidden)
             .refreshable { reload() }   // 下拉刷新：重讀佇列
@@ -281,6 +282,28 @@ private struct OutboxDebugScreen: View {
     private func reload() {
         points = reporter.outboxPeek()
         visits = reporter.visitOutboxPeek()
+        logs = reporter.visitLogPeek().reversed()   // 最新的排最上面（要看的通常是剛剛那一筆）
+    }
+
+    // 停留診斷紀錄：不是待辦佇列、是已經發生過的事，所以只讀不清（清空按鈕放在最下面一列）
+    @ViewBuilder private var logRows: some View {
+        if logs.isEmpty {
+            emptyRow("還沒有停留的紀錄。iPhone 交出停留、或回報開關被打開時，這裡才會長東西。")
+        } else {
+            ForEach(Array(logs.enumerated()), id: \.offset) { _, line in
+                let parts = line.split(separator: "\t", maxSplits: 1).map(String.init)
+                VStack(alignment: .leading, spacing: 2) {
+                    Text(parts.count > 1 ? parts[1] : line)
+                        .font(.system(size: 13, weight: .semibold)).foregroundStyle(BearTheme.cream)
+                    Text(parts.first ?? "")
+                        .font(.system(size: 11)).foregroundStyle(BearTheme.cream.opacity(0.5))
+                }
+                .listRowBackground(BearTheme.surface)
+            }
+            Button("清空紀錄") { reporter.clearVisitLog(); reload() }
+                .font(.system(size: 13)).foregroundStyle(BearTheme.cream.opacity(0.6))
+                .listRowBackground(BearTheme.surface)
+        }
     }
 
     @ViewBuilder private var pointRows: some View {

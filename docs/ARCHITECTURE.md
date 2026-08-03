@@ -1,6 +1,6 @@
 # ARCHITECTURE — kc_wherebear 系統架構
 
-> **English summary:** A whole-system engineering overview of kc_wherebear — how a native iOS SwiftUI app reports location to a self-hosted Supabase backend, how a local bridge layer turns that into local files, and how a downstream consumer reads those files with no outbound calls of its own. Data reaches the consumer by two independent paths: a polled snapshot, and a pushed event stream for arrivals at / departures from user-named places (emitted by a database trigger, delivered over a private Realtime broadcast, and consumed by a long-running listener). It walks through the system diagram, the data model (split into three function-scoped ER diagrams), the end-to-end flows (write path, snapshot read path, and the two-part event path), the iOS app's layered architecture, and the deployment topology — nine mermaid diagrams in all. Interface values are not duplicated here — the contract lives in `API_CONTRACT.md`.
+> **English summary:** A whole-system engineering overview of kc_wherebear — how a native iOS SwiftUI app reports location to a self-hosted Supabase backend, how a local bridge layer turns that into local files, and how a downstream consumer reads those files with no outbound calls of its own. Data reaches the consumer by two independent paths: a polled snapshot, and a pushed event stream for arrivals at / departures from user-named places (emitted by a database trigger, delivered over a private Realtime broadcast, and consumed by a long-running listener). It walks through the system diagram, the data model (split into three function-scoped ER diagrams), the end-to-end flows (write path, snapshot read path, and the two-part event path), the iOS app's layered architecture, and the deployment topology — nine mermaid diagrams in all. Interface values are not duplicated here — the contract lives in `API_CONTRACT.md`. The entity diagram now also covers the per-stay adjudication row and its append-only revision history.
 
 > 全景工程文件：**手機回報位置 → 自架 Supabase → 本地 bridge → 下游消費者**的一條龍。
 > 這份給「想快速看懂整個系統長怎樣」的人；**介面細節不在這** —— 契約看 [`API_CONTRACT.md`](API_CONTRACT.md)（SSOT）、設計理由看 [`DESIGN.md`](DESIGN.md) / [`DESIGN_app.md`](DESIGN_app.md)、可調參數看 [`TUNABLES.md`](TUNABLES.md)。這份只畫「元件怎麼接、資料怎麼流」，不複製契約值。
@@ -128,6 +128,8 @@ erDiagram
 erDiagram
     auth_users ||--o{ visits : "CLVisit 停留"
     auth_users ||--o{ landmarks : "自訂 alias"
+    visits ||--o| visit_event_decisions : "這段是哪裡（一段一列）"
+    visits ||--o{ visit_decision_revisions : "裁決歷程（append-only）"
 
     auth_users {
         uuid id PK
@@ -151,12 +153,38 @@ erDiagram
         geography geog "generated · GiST"
         int radius "公尺 >0"
     }
+    visit_event_decisions {
+        bigint visit_id PK
+        text decision_status "pending / resolved / unresolved"
+        text reason_code "判成這樣的理由"
+        text name_snapshot "定案的地名（unresolved 為 null）"
+        boolean legacy_would_emit "舊演算法會不會發（解釋當初為何沒發）"
+        int evidence_count
+        timestamptz decided_at "初次定案時刻·不被重判覆寫"
+        timestamptz arrival_sent_at "非 null=已對外宣告·終態"
+        timestamptz departure_sent_at
+    }
+    visit_decision_revisions {
+        bigint id PK
+        bigint visit_id FK
+        int revision "同一段停留內遞增"
+        text trigger_source "initial / landmark_change / departure_recheck / user_assignment / policy_upgrade"
+        text decision_status "那一刻的狀態"
+        text reason_code
+        text name_snapshot
+        timestamptz created_at
+    }
     geocode_cache {
         double lat_key PK "四捨五入 ~11m"
         double lng_key PK
         text name "可 null"
     }
 ```
+
+`visit_event_decisions` 是**每段停留一列**的當前狀態；`visit_decision_revisions` 是它的
+append-only 歷程，舊列永不覆寫。兩者分開的理由：`decided_at` 與 `legacy_would_emit` 記的是
+「當初為何這樣判」，而地標目錄會隨時間改變 —— 少了歷程，一段停留後來被重新命名之後，
+就再也回答不了「它當初為什麼沒推播」。
 
 `visits` 的唯一鍵是 `(user_id, arrived_at)`、**不含座標**（`DESIGN D14`：CLVisit 同一次停留投遞兩次且座標會漂）。`departed_at` 的收尾接受兩種證據（`DESIGN D15`），不是只等 CLVisit 給。
 

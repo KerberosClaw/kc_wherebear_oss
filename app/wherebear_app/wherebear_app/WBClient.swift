@@ -214,6 +214,28 @@ extension Data {
 }
 
 // ISO8601 (with/without fractional seconds) → Date
+// 診斷紀錄的時間一律用**裝置系統時區**顯示。
+//
+// 🔴 那一頁是給人看的，跟「我幾點出門」對照時 UTC 要心算加減時差，最容易看錯的就是
+//    跨午夜那幾筆。上傳到後端的仍然是 UTC ISO —— 線上格式不變，只有顯示改。
+//    用 autoupdatingCurrent：出國換時區、或系統時區被改，下一次寫入就自動跟著變。
+enum WBLogTime {
+    private static func formatter() -> DateFormatter {
+        let f = DateFormatter()
+        f.dateFormat = "MM-dd HH:mm:ss"
+        f.timeZone = .autoupdatingCurrent
+        f.locale = Locale(identifier: "en_US_POSIX")
+        return f
+    }
+    static func text(_ d: Date) -> String { formatter().string(from: d) }
+    /// 拿線上格式的 ISO 字串轉成當地時間顯示；解不出來就原樣回傳（不吞掉資訊）
+    static func text(iso s: String?) -> String {
+        guard let s else { return "?" }
+        guard let d = WBDate.parse(s) else { return s }
+        return text(d)
+    }
+}
+
 enum WBDate {
     static func parse(_ s: String?) -> Date? {
         guard let s else { return nil }

@@ -30,6 +30,9 @@ struct Stay: Identifiable {
     var confidence: Double = 1  // 契約 §2.2：float 0..1
     var source: Source = .live
     var coordinate: CLLocationCoordinate2D? = nil  // centroid
+    // 這一段停留在後端的身分。有值才有辦法說「我指的就是這一段」——命名時直接把人為指定
+    // 送回去，不必等感測器湊足票數。live／相片匯入來源沒有對應的 visit，因此為 nil。
+    var visitId: Int? = nil
 }
 
 extension Stay {
