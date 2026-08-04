@@ -1,6 +1,6 @@
 # TUNABLES — 可調參數速查
 
-> **English summary:** A quick-reference for kc_wherebear's tunable behavior parameters and where each one lives in the source. It lists the stay-detection thresholds (minimum dwell, cluster radius, gap), the app's location-report frequencies and desired accuracy for saver/standard modes, the bridge daemon's poll interval, and the geocode cache's coordinate-rounding precision. It also covers the core-window union used when fusing a CLVisit dwell with a GPS cluster, and the app-side dedup window that drops a location fix delivered twice by two triggers. It also documents the versioned place-name adjudication policy — evidence-window bounds, the two vote thresholds, the live-fix accuracy cutoff, and the age limit past which an event is no longer pushed to the realtime channel. It records current values only — to change a parameter, edit it at its source.
+> **English summary:** A quick-reference for kc_wherebear's tunable behavior parameters and where each one lives in the source. It lists the stay-detection thresholds (minimum dwell, cluster radius, gap), the app's location-report frequencies and desired accuracy for saver/standard modes, the bridge daemon's poll interval, and the geocode cache's coordinate-rounding precision. It also covers the core-window union used when fusing a CLVisit dwell with a GPS cluster, and the app-side dedup window that drops a location fix delivered twice by two triggers. It also documents the versioned place-name adjudication policy — evidence-window bounds, the two vote thresholds, the live-fix accuracy cutoff, and the age limit past which an event is no longer pushed to the realtime channel. It also covers the stay-settling evidence thresholds and the 24-hour grace period bounding how long an unclosed stay may keep claiming presence. It records current values only — to change a parameter, edit it at its source.
 
 > 「行為門檻／頻率」類參數的單一速查。**問參數先看這、免撈 code。** 本檔只記現值＋來源位置；要改請改對應來源。
 > 🔴 born-clean：本檔只有通用參數，無座標／金鑰／身分。
@@ -51,17 +51,6 @@ app 走 `my_today_stays` / `my_stays_range` / `my_stays_days`，皆用上述**�
 |---|---|
 | `WHEREBEAR_POLL_SECONDS` | 300（5 分）；**prod 建議 600（10 分）**——下游消費者間隔更長、5 分過密 |
 
-## 停留段收尾（D15；`supabase/migrations/*_visits_autoclose_stale.sql` ／ `*_departure_evidence_adaptive_threshold.sql`）
-
-| 參數 | 現值 | 說明 |
-|---|---|---|
-| 反證寬限 `gap_min` | 15 分 | 走開多久才算真的離開（**防誤關主要靠這條**，不是距離） |
-| 距離門檻地板 | 120 公尺 | |
-| 地標加成 | 該地標半徑 ＋ 50 公尺 | 公園之類半徑大的地方要真的走出去 |
-| 誤差加成 | 停留誤差 ＋ 當前定位誤差 ＋ 100 公尺 | 兩邊定位都爛時自動放寬 |
-
-實際門檻＝三者取大。🔴 **不要改回寫死常數**：第一版寫死 250 公尺，剛好擋不住當初要修的 209 公尺實例。
-
 ## event bridge（`bridge/wherebear_event_bridge.ts`，env 設定）
 
 | 參數 | 現值 | 說明 |
@@ -84,6 +73,18 @@ app 走 `my_today_stays` / `my_stays_range` / `my_stays_days`，皆用上述**�
 | 誤差加成 | 停留誤差 ＋ 當前定位誤差 ＋ 100 公尺 | 兩邊定位都爛時自動放寬 |
 
 實際門檻＝三者取大。🔴 **不要改回寫死常數**：第一版寫死 250 公尺，剛好擋不住當初要修的 209 公尺實例。
+
+### 未關閉停留的封頂（`supabase/migrations/*_visit_open_stay_cap.sql`）
+
+上面那三道保險都要求「之後還有新資料進來」。使用者停掉回報／刪 app／手機沒電時前提不成立，那列會永遠開著、被讀取層當成「還在那裡」畫進往後每一天。封頂是兜底。
+
+| 參數 | 現值 | 說明 |
+|---|---|---|
+| `p_open_grace_s`（`visit_open_until`） | **86400（24 小時）** | 未關閉的停留最多還能宣稱到「最後一次收到任何位置回報 ＋ 此秒數」；`visits_for_day` 與 `visits_autoclose_stale` 共用同一支、不各寫一份 |
+
+🔴 **不要把它調到分鐘級**：沉默是有歧義的 —— 人不動時 significant-change 本來就不觸發，回報開著也可能好幾小時沒有任何一筆（實測合法沉默最長 416 分鐘）。用分鐘級的值當寬限會把真實的整夜停留砍成半小時，比原本的病更糟（`detect_stays` 的 `p_gap_s` 原本設 30 分，就是踩到這個坑才改成 8 小時）。這裡取 24 小時＝遠高於實測合法沉默、且對齊「按當地日切段」的既有模型；**比 `p_gap_s` 更寬是刻意的** —— 那條管「同一段停留怎麼聚」，這條管「還能不能宣稱人在那裡」，後者該更保守。
+
+app 端另有一層更準的：按下停止時直接 PATCH 補上 `departed_at`（`LocationReporter.closeOpenVisits`）。兩層刻意並存 —— app 那層準（知道確切時刻）、後端這層兜底（app 沒機會講話時也不會爛）。
 
 ## 事件地名裁決 `visit_event_policies`（版本化；調參＝新增一列並切換 active，**不可原地改**）
 
