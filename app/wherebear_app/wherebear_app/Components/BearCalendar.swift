@@ -8,6 +8,7 @@ struct BearCalendar: View {
     var recorded: Set<String>            // 有記錄的 "yyyy-MM-dd"
     @Binding var month: Date             // 顯示中的月（任一該月日期）
     var onMonthChange: () -> Void        // 切月後（month 已更新）→ 外面重載該月 recorded
+    var onSelect: ((Date) -> Void)? = nil // 區間選擇共用月曆；nil 保留多選切換
 
     private var cal: Calendar {
         var c = Calendar(identifier: .gregorian)
@@ -69,7 +70,9 @@ struct BearCalendar: View {
         let isFuture = cal.startOfDay(for: d) > cal.startOfDay(for: Date())
         let num = cal.component(.day, from: d)
         return Button {
-            if isSel { selected.remove(k) } else { selected.insert(k) }
+            if let onSelect { onSelect(d) }
+            else if isSel { selected.remove(k) }
+            else { selected.insert(k) }
         } label: {
             VStack(spacing: 1) {
                 Text("\(num)")

@@ -6,9 +6,7 @@ import MapKit
 struct MapHomeScreen: View {
     @Environment(LocationReporter.self) private var reporter
     @Environment(LocationVM.self) private var vm
-    @Environment(ProfileManager.self) private var profile
     @Environment(LandmarkManager.self) private var landmarks
-    @Environment(SupabaseSession.self) private var session
 
     var recenterTick: Int = 0   // MainTabView：切到地圖 tab 就 +1 → 置中回 user
 
@@ -27,93 +25,122 @@ struct MapHomeScreen: View {
         var coordinate: CLLocationCoordinate2D
     }
 
+    @Environment(\.horizontalSizeClass) private var sizeClass
+    @Environment(\.adaptiveControlRail) private var controlRail
+
     var body: some View {
-        ZStack {
-            Map(position: $camera) {
-                UserAnnotation {
-                    PawPinView(active: followMode == .followHeading) { cycleTracking() } // 點熊掌＝同追蹤鈕、循環三態
-                }
-            }
-            .mapControls { }   // 隱藏系統內建控制（轉向時不再冒出右上角羅盤）
-            .mapStyle(.standard(elevation: .flat, pointsOfInterest: .excludingAll))
-            .onMapCameraChange(frequency: .continuous) { ctx in
-                currentDistance = ctx.camera.distance                    // 記住縮放（pinch）→ zoom 不被鎖
-                guard let loc = reporter.lastLocation?.coordinate else { return }
-                let off = distanceMeters(ctx.camera.centerCoordinate, loc)
-                if settling {                                            // 相機還在飛回自己 → 別誤判成脫離
-                    if off < currentDistance * 0.07 { settling = false } // 貼回自己了、恢復偵測
-                    return
-                }
-                // 原生跟隨時相機貼著自己（off≈0）；手指把地圖拖離自己（>15% 視野）就脫離、冒出回到我；純縮放中心仍貼著自己、不脫離。
-                if isFollowing, off > currentDistance * 0.15 { followMode = .free }
-            }
-            .ignoresSafeArea()
+        GeometryReader { geo in
+            let layout = AdaptiveMapLayout(geo, regular: sizeClass == .regular, controlRail: controlRail)
+            let compactControls = layout.compactOverlay || sizeClass == .regular || layout.divided
+            let controlArea = layout.divided ? layout.panel : layout.contentBounds
+            let informationArea = layout.mode == .book ? layout.panel
+                : (layout.mode == .laptop ? layout.map : layout.contentBounds)
+            // On the inner display the system status controls occupy the right.
+            // Keep the left information group near the physical top edge.
+            let informationTopOffset = compactControls && !layout.compactOverlay
+                ? -max(0, geo.safeAreaInsets.top - 12) : 0
+            ZStack {
 
-            // 頂部：地名卡＋狀態 pill（左）、頭貼選單（右）
-            VStack {
-                HStack(alignment: .top) {
-                    VStack(alignment: .leading, spacing: 8) {
-                        if hasLocationCard {
-                            LocationNameCard(name: displayName)
-                        }
-                        StatusPill(status: primaryStatus, onOpenSettings: openSystemSettings)
-                        if case .reporting = primaryStatus, let cur = vm.current, cur.isStale {
-                            StatusPill(status: .stale(staleText(cur)))
-                        }
+                Map(position: $camera) {
+                    UserAnnotation {
+                        PawPinView(active: followMode == .followHeading) { cycleTracking() } // 點熊掌＝同追蹤鈕、循環三態
                     }
-                    Spacer()
-                    avatarMenu
                 }
-                .padding(.horizontal, 16)
-                .padding(.top, 6)
-                Spacer()
-            }
+                .mapControls { }   // 隱藏系統內建控制（轉向時不再冒出右上角羅盤）
+                .mapStyle(.standard(elevation: .flat, pointsOfInterest: .excludingAll))
+                .onMapCameraChange(frequency: .continuous) { ctx in
+                    currentDistance = ctx.camera.distance                    // 記住縮放（pinch）→ zoom 不被鎖
+                    guard let loc = reporter.lastLocation?.coordinate else { return }
+                    let off = distanceMeters(ctx.camera.centerCoordinate, loc)
+                    if settling {                                            // 相機還在飛回自己 → 別誤判成脫離
+                        if off < currentDistance * 0.07 { settling = false } // 貼回自己了、恢復偵測
+                        return
+                    }
+                    // 原生跟隨時相機貼著自己（off≈0）；手指把地圖拖離自己（>15% 視野）就脫離、冒出回到我；純縮放中心仍貼著自己、不脫離。
+                    if isFollowing, off > currentDistance * 0.15 { followMode = .free }
+                }
+                .ignoresSafeArea()
+                .safeAreaInset(edge: .leading, spacing: 0) {
+                    Color.clear.frame(width: layout.mode == .book ? layout.map.minX : 0)
+                        .allowsHitTesting(false)
+                }
+                .safeAreaInset(edge: .bottom, spacing: 0) {
+                    Color.clear.frame(height: layout.mode == .laptop ? layout.bounds.height - layout.map.maxY : 0)
+                        .allowsHitTesting(false)
+                }
+                .layoutFrame(layout.bounds)
 
-            if vm.current == nil && reporter.lastLocation == nil {
-                EmptyStateBear(title: "熊熊還不知道你在哪裡",
-                               message: "點右下角的熊掌開始回報，足跡就會出現在這裡。")
-                    .padding(.horizontal, 44)
-            }
-
-            // 底部：長停留命名卡（左）＋熊掌開關（右下）
-            VStack {
-                Spacer()
-                if let pending = landmarks.pendingLongStay {
-                    LongStayPromptCard(
-                        onName: {
-                            landmarks.dismissLongStay()
-                            naming = NamingTarget(coordinate: pending)
-                        },
-                        onSkip: { landmarks.dismissLongStay() }
-                    )
+                // 窄視窗的資訊與控制一起靠向系統側欄的另一側。
+                VStack {
+                    HStack(alignment: .top, spacing: 12) {
+                        if compactControls && !layout.compactOverlay { ProfileMenu(size: 44) }
+                        VStack(alignment: layout.controlsOnTrailingEdge ? .trailing : .leading, spacing: 8) {
+                            if hasLocationCard {
+                                LocationNameCard(name: displayName)
+                            }
+                            StatusPill(status: primaryStatus, onOpenSettings: openSystemSettings)
+                            if case .reporting = primaryStatus, let cur = vm.current, cur.isStale {
+                                StatusPill(status: .stale(staleText(cur)))
+                            }
+                        }
+                        .frame(maxWidth: layout.split ? 360 : .infinity,
+                               alignment: layout.controlsOnTrailingEdge ? .trailing : .leading)
+                        if !layout.controlsOnTrailingEdge { Spacer(minLength: 0) }
+                        if !compactControls { ProfileMenu(size: 76) }
+                    }
                     .padding(.horizontal, 16)
-                    .padding(.bottom, 8)
-                    .transition(.move(edge: .bottom).combined(with: .opacity))
-                }
-                HStack {
+                    .padding(.top, layout.compactOverlay ? layout.topInset + 8 : (compactControls ? 16 : 6))
                     Spacer()
-                    VStack(spacing: 12) {   // 右下角：熊掌開始鈕 + 其下 Apple 式常駐追蹤鈕（三態循環）
-                        PawReportButton(isOn: reporter.isReporting) {
-                            reporter.isReporting ? reporter.stop() : reporter.start()
-                        }
-                        Button { cycleTracking() } label: {   // 空心=不跟 / 實心=跟隨正北 / 北箭頭=跟隨+羅盤
-                            Image(systemName: trackingIcon)
-                                .font(.system(size: 16, weight: .semibold))
-                                .contentTransition(.symbolEffect(.replace))
-                                .foregroundStyle(followMode == .free ? BearTheme.cream.opacity(0.65) : BearTheme.honeyLight)
-                                .frame(width: 44, height: 44)
-                                .background(Circle().fill(BearTheme.surface)
-                                    .overlay(Circle().strokeBorder(.white.opacity(0.1), lineWidth: 0.5)))
-                                .shadow(color: .black.opacity(0.22), radius: 6, y: 2)
-                        }
-                        .buttonStyle(.plain)
-                    }
                 }
-                .padding(.trailing, 20)
-                .padding(.bottom, 14)
+
+                .layoutFrame(informationArea)
+                .offset(y: informationTopOffset)
+
+                if vm.current == nil && reporter.lastLocation == nil {
+                    EmptyStateBear(title: "熊熊還不知道你在哪裡",
+                                   message: "點熊掌開始回報，足跡就會出現在這裡。")
+                        .padding(.horizontal, 44)
+                        .layoutFrame(layout.divided ? layout.map : layout.contentBounds)
+                }
+
+                // 窄視窗避開側邊導覽列；寬視窗仍靠左，一般手機保留右下排列。
+                VStack {
+                    Spacer()
+                    if let pending = landmarks.pendingLongStay {
+                        LongStayPromptCard(
+                            onName: {
+                                landmarks.dismissLongStay()
+                                naming = NamingTarget(coordinate: pending)
+                            },
+                            onSkip: { landmarks.dismissLongStay() }
+                        )
+                        .padding(.horizontal, 16)
+                        .padding(.bottom, 8)
+                        .transition(.move(edge: .bottom).combined(with: .opacity))
+                    }
+                    HStack {
+                        if !compactControls || layout.controlsOnTrailingEdge { Spacer() }
+                        let controls = compactControls
+                            ? AnyLayout(HStackLayout(alignment: .top, spacing: 20))
+                            : AnyLayout(VStackLayout(spacing: 12))
+                        controls {   // 回報與定位切換維持同一組
+                            PawReportButton(isOn: reporter.isReporting, compact: compactControls) {
+                                reporter.isReporting ? reporter.stop() : reporter.start()
+                            }
+                            trackingControl(compact: compactControls)
+
+                        }
+                        if compactControls && !layout.controlsOnTrailingEdge { Spacer() }
+                    }
+                    .padding(.leading, compactControls ? 16 : 0)
+                    .padding(.trailing, compactControls ? 16 : 20)
+                    .padding(.bottom, 14)
+                }
+                .layoutFrame(controlArea)
+                .animation(.spring(response: 0.35, dampingFraction: 0.85), value: landmarks.pendingLongStay != nil)
+                .animation(.spring(response: 0.35, dampingFraction: 0.85), value: followMode)
+                ReservedInteractionShield(layout: layout)
             }
-            .animation(.spring(response: 0.35, dampingFraction: 0.85), value: landmarks.pendingLongStay != nil)
-            .animation(.spring(response: 0.35, dampingFraction: 0.85), value: followMode)
         }
         .background(BearTheme.bg)
         .task { await vm.refreshCurrent() } // 登入後（token 就緒）載入當前位置/名稱（不動時間軸選擇）
@@ -126,24 +153,38 @@ struct MapHomeScreen: View {
         }
     }
 
-    // MARK: - 頭貼選單（入口②：email／登出／未來找朋友）。設定 tab 仍保留。
-    private var avatarMenu: some View {
-        Menu {
-            if let email = session.userEmail {
-                Section(email) { menuItems }
-            } else {
-                menuItems
+    private func trackingControl(compact: Bool) -> some View {
+        VStack(spacing: 7) {
+            Button { cycleTracking() } label: {
+                Image(systemName: trackingIcon)
+                    .font(.system(size: compact ? 20 : 16, weight: .semibold))
+                    .contentTransition(.symbolEffect(.replace))
+                    .foregroundStyle(followMode == .free ? BearTheme.cream.opacity(0.65) : BearTheme.honeyLight)
+                    .frame(width: compact ? 56 : 44, height: compact ? 56 : 44)
+                    .background(Circle().fill(BearTheme.surface)
+                        .overlay(Circle().strokeBorder(.white.opacity(0.1), lineWidth: 0.5)))
+                    .frame(width: compact ? 64 : 44, height: compact ? 64 : 44)
+                    .contentShape(Circle())
+                    .shadow(color: .black.opacity(0.22), radius: 6, y: 2)
             }
-        } label: {
-            AvatarView(image: profile.avatarImage, url: profile.avatarURL, size: 76)  // 放大＋頂對齊左側兩張卡
+            .buttonStyle(.plain)
+            .accessibilityLabel("定位切換")
+            .accessibilityValue(trackingLabel)
+            if compact {
+                Text(trackingLabel)
+                    .font(.system(size: 11.5, weight: .bold))
+                    .foregroundStyle(BearTheme.cream)
+                    .padding(.horizontal, 12).padding(.vertical, 5)
+                    .glassEffect(.regular.tint(BearTheme.surfaceHi.opacity(0.6)), in: .capsule)
+            }
         }
     }
 
-    @ViewBuilder private var menuItems: some View {
-        Button { } label: { Label("找朋友 · 即將推出", systemImage: "person.2.fill") }
-            .disabled(true)
-        Button(role: .destructive) { session.signOut() } label: {
-            Label("登出", systemImage: "rectangle.portrait.and.arrow.right")
+    private var trackingLabel: String {
+        switch followMode {
+        case .free: "回到我"
+        case .followNorth: "正北跟隨"
+        case .followHeading: "羅盤跟隨"
         }
     }
 
