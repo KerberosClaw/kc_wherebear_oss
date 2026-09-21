@@ -14,6 +14,9 @@ struct CollapsibleSheet<Accessory: View, Content: View>: View {
     var fullTopFraction: CGFloat = 0.15        // full 距畫面頂比例（由外面依「有無 callout」動態帶入）
     var halfTopFraction: CGFloat = 0.46        // half：約中間
     var collapsedVisibleHeight: CGFloat = 158  // collapsed：露出高度
+    var floating = false
+    var minimumTop: CGFloat = 0
+    @Binding var scrollOffset: CGFloat
     @ViewBuilder var accessory: Accessory
     @ViewBuilder var content: Content
 
@@ -21,9 +24,13 @@ struct CollapsibleSheet<Accessory: View, Content: View>: View {
 
     var body: some View {
         GeometryReader { geo in
-            let fullTop = geo.size.height * fullTopFraction
-            let halfTop = geo.size.height * halfTopFraction
-            let collapsedTop = geo.size.height - collapsedVisibleHeight
+            let stops = CollapsibleSheetStops(height: geo.size.height,
+                fullTopFraction: fullTopFraction, halfTopFraction: halfTopFraction,
+                collapsedVisibleHeight: collapsedVisibleHeight,
+                minimumTop: minimumTop, bottomGap: floating ? 12 : 0)
+            let fullTop = stops.full
+            let halfTop = stops.half
+            let collapsedTop = stops.collapsed
             let base = topFor(detent, full: fullTop, half: halfTop, collapsed: collapsedTop)
             let top = min(collapsedTop, max(fullTop, base + dragOffset))
 
@@ -32,19 +39,21 @@ struct CollapsibleSheet<Accessory: View, Content: View>: View {
                 ScrollView {
                     content
                         .padding(.horizontal, 18)
-                        .padding(.bottom, 112) // 淨空浮動 tab bar（frame 已修為可見高度、不再被 offset 吃掉；此值＝真實淨空、可微調）
+                        .padding(.bottom, floating ? 18 : 112) // 淨空浮動 tab bar（frame 已修為可見高度、不再被 offset 吃掉；此值＝真實淨空、可微調）
                 }
+                .modifier(RememberTimelineScroll(offset: $scrollOffset))
                 .scrollDisabled(detent == .collapsed)
             }
             // frame 高度＝可見高度（geo.height − top）而非整螢幕 → ScrollView 視窗＝實際可見、捲動範圍算對、
             // 最後幾列捲得到（修 #2/#3）；offset 仍下移 top、sheet 底剛好貼螢幕底、不再溢出螢幕外。
-            .frame(width: geo.size.width, height: max(0, geo.size.height - top), alignment: .top)
+            .frame(width: max(0, geo.size.width - (floating ? 24 : 0)), height: max(0, geo.size.height - top - (floating ? 12 : 0)), alignment: .top)
             .background(BearTheme.sheet.opacity(0.96))
-            .clipShape(UnevenRoundedRectangle(topLeadingRadius: 26, topTrailingRadius: 26))
+            .clipShape(UnevenRoundedRectangle(topLeadingRadius: 26, bottomLeadingRadius: floating ? 26 : 0, bottomTrailingRadius: floating ? 26 : 0, topTrailingRadius: 26))
             .shadow(color: .black.opacity(0.4), radius: 15, y: -8)
-            .offset(y: top)
+            .offset(x: floating ? 12 : 0, y: top)
+            .onChange(of: geo.size) { _, _ in dragOffset = 0 }
         }
-        .ignoresSafeArea(edges: .bottom)
+        .ignoresSafeArea(edges: floating ? [] : .bottom)
     }
 
     private func topFor(_ d: SheetDetent, full: CGFloat, half: CGFloat, collapsed: CGFloat) -> CGFloat {
@@ -100,5 +109,27 @@ struct CollapsibleSheet<Accessory: View, Content: View>: View {
     private func nearestDetent(to y: CGFloat, full: CGFloat, half: CGFloat, collapsed: CGFloat) -> SheetDetent {
         let options: [(SheetDetent, CGFloat)] = [(.full, full), (.half, half), (.collapsed, collapsed)]
         return options.min { abs($0.1 - y) < abs($1.1 - y) }!.0
+    }
+}
+
+// Keep the last user-controlled offset when switching between a drawer and
+// a fixed pane. Initial layout callbacks must not overwrite it with zero.
+struct RememberTimelineScroll: ViewModifier {
+    @Binding var offset: CGFloat
+    @State private var position = ScrollPosition()
+    @State private var userScrolling = false
+
+    func body(content: Content) -> some View {
+        content
+            .scrollPosition($position)
+            .onAppear { position.scrollTo(y: offset) }
+            .onScrollPhaseChange { _, phase in
+                userScrolling = phase == .interacting || phase == .decelerating
+            }
+            .onScrollGeometryChange(for: CGFloat.self) {
+                max(0, $0.contentOffset.y + $0.contentInsets.top)
+            } action: { _, value in
+                if userScrolling { offset = value }
+            }
     }
 }

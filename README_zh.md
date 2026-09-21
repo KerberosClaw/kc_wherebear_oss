@@ -51,6 +51,26 @@ flowchart TD
 
 完整規劃見 [`docs/ROADMAP.md`](docs/ROADMAP.md)；自架步驟見 [`docs/DEPLOYMENT.md`](docs/DEPLOYMENT.md)。
 
+## iPhone Duo —— 版面適配完成，但還沒碰過實機
+
+app 的版面已經照 iPhone Duo 調過：七種視窗形狀、摺痕與鏡頭遮擋區改成跟系統要而不是拿螢幕中央
+常數猜、內螢幕的多 App Split View 也處理了。以上全部只在 Simulator 與純 Swift 幾何檢查裡驗過。
+**沒有人在真的摺疊機上跑過**，理由很單純：那支手機 2026-10-23 才上市。
+
+所以你手上如果已經有一台，**非常歡迎開 issue 或送 PR**。適配筆記裡列了最值得先看的四件事，
+以及回報時要附上哪些數值。幾何回歸不需要模擬器、不需要裝置、也不需要後端，在 repo 根目錄直接跑：
+
+```bash
+xcrun swiftc \
+  app/wherebear_app/wherebear_app/Components/AdaptiveMapLayoutGeometry.swift \
+  app/wherebear_app/wherebear_app/Components/CollapsibleSheetGeometry.swift \
+  tests/swift/AdaptiveMapLayoutChecks.swift \
+  -o /tmp/wherebear-layout-checks && /tmp/wherebear-layout-checks
+```
+
+版面規格見 [`docs/IPHONE_DUO.md`](docs/IPHONE_DUO.md)；
+踩了哪些坑、怎麼修的見 [`docs/IPHONE_DUO_LESSONS.md`](docs/IPHONE_DUO_LESSONS.md)。
+
 ## 目錄
 
 ```
@@ -58,7 +78,8 @@ wherebear/
 ├── app/        iOS：SwiftUI（元件化 UI + 邏輯層）
 ├── supabase/   後端：migrations（雙表 + RLS + pg_cron）+ functions（Edge Functions）
 ├── bridge/     本地 daemon：拉 Supabase → 寫本地 JSON
-└── docs/       DESIGN · ROADMAP · SECURITY · API_CONTRACT · DEPLOYMENT · TUNABLES · ARCHITECTURE
+├── docs/       DESIGN · ROADMAP · SECURITY · API_CONTRACT · DEPLOYMENT · TUNABLES · ARCHITECTURE · IPHONE_DUO
+└── tests/      純 Swift 版面幾何檢查（不需要模擬器）
 ```
 
 > **Security Notice.** 座標、金鑰一律不進 git —— repo 只放通用 code 跟佔位範本（`.example`），真實 key／URL 住在 gitignored 的 `.env` 跟 `Config.local.swift`。`service_role` 金鑰永遠不落地 client，只活在 Supabase function secrets。手機端每人各自登入（RLS 綁 `auth.uid()`）、bridge 端拿可撤銷的 hashed `wb_` API key 讀。外部服務：你自己的 Supabase 專案、以及做地名反查的 Nominatim。發現洞？開個 issue。

@@ -4,6 +4,7 @@ import SwiftUI
 
 struct PawReportButton: View {
     var isOn: Bool
+    var compact = false
     var action: () -> Void
 
     var body: some View {
@@ -13,20 +14,20 @@ struct PawReportButton: View {
                     if isOn {
                         Circle()
                             .strokeBorder(BearTheme.green.opacity(0.85), lineWidth: 2)
-                            .frame(width: 90, height: 90)
+                            .frame(width: compact ? 64 : 90, height: compact ? 64 : 90)
                         Circle().fill(BearTheme.honeyGradient)
-                            .frame(width: 76, height: 76)
-                        PawGlyph(size: 36)
+                            .frame(width: compact ? 56 : 76, height: compact ? 56 : 76)
+                        PawGlyph(size: compact ? 26 : 36)
                     } else {
                         Circle().fill(.white.opacity(0.08))
-                            .frame(width: 76, height: 76)
+                            .frame(width: compact ? 56 : 76, height: compact ? 56 : 76)
                         Circle().strokeBorder(BearTheme.honeyLight.opacity(0.4), lineWidth: 1.5)
-                            .frame(width: 76, height: 76)
-                        PawGlyph(color: BearTheme.honeyLight, size: 36)
+                            .frame(width: compact ? 56 : 76, height: compact ? 56 : 76)
+                        PawGlyph(color: BearTheme.honeyLight, size: compact ? 26 : 36)
                             .opacity(0.75)
                     }
                 }
-                .frame(width: 90, height: 90)
+                .frame(width: compact ? 64 : 90, height: compact ? 64 : 90)
                 .shadow(color: isOn ? BearTheme.honey.opacity(0.4) : .clear, radius: 16, y: 8)
                 .contentShape(Circle())
             }

@@ -51,6 +51,29 @@ Stack: native Swift (no cross-platform detour) + Supabase-native (BaaS — DB/Au
 
 Full roadmap: [`docs/ROADMAP.md`](docs/ROADMAP.md). Self-hosting steps: [`docs/DEPLOYMENT.md`](docs/DEPLOYMENT.md).
 
+## iPhone Duo — adapted, not yet touched by real hardware
+
+The app now lays itself out for iPhone Duo: seven window shapes, hinge and camera regions read from
+the system instead of guessed from screen-centre constants, and multi-app Split View on the inner
+screen. Every bit of that was verified in Simulator and in pure-Swift geometry checks. **Nobody has
+run it on an actual folding phone**, for the excellent reason that the phone doesn't ship until
+2026-10-23.
+
+So if you have one: issues and pull requests are very welcome. The layout notes list the four things
+worth looking at first, and what to attach when reporting. The geometry regression needs no
+Simulator, no device and no backend — it compiles and runs straight from the repo root:
+
+```bash
+xcrun swiftc \
+  app/wherebear_app/wherebear_app/Components/AdaptiveMapLayoutGeometry.swift \
+  app/wherebear_app/wherebear_app/Components/CollapsibleSheetGeometry.swift \
+  tests/swift/AdaptiveMapLayoutChecks.swift \
+  -o /tmp/wherebear-layout-checks && /tmp/wherebear-layout-checks
+```
+
+Layout spec: [`docs/IPHONE_DUO.md`](docs/IPHONE_DUO.md).
+What broke and how it was fixed: [`docs/IPHONE_DUO_LESSONS.md`](docs/IPHONE_DUO_LESSONS.md).
+
 ## Layout
 
 ```
@@ -58,7 +81,8 @@ wherebear/
 ├── app/        iOS: SwiftUI (component UI + logic layer)
 ├── supabase/   backend: migrations (two tables + RLS + pg_cron) + functions (Edge Functions)
 ├── bridge/     local daemon: pull Supabase → write local JSON
-└── docs/       DESIGN · ROADMAP · SECURITY · API_CONTRACT · DEPLOYMENT · TUNABLES · ARCHITECTURE
+├── docs/       DESIGN · ROADMAP · SECURITY · API_CONTRACT · DEPLOYMENT · TUNABLES · ARCHITECTURE · IPHONE_DUO
+└── tests/      pure-Swift layout geometry checks (no Simulator needed)
 ```
 
 > **Security Notice.** Coordinates and credentials never belong in git — the repo ships only generic code and placeholder templates (`.example` files); real keys and URLs live in gitignored `.env` and `Config.local.swift`. The `service_role` key never touches the client; it lives only in Supabase function secrets. The phone authenticates per-user (RLS on `auth.uid()`); the bridge reads via a revocable, hashed `wb_` API key. External services used: your own Supabase project, plus Nominatim for reverse-geocoding place names. Found a hole? Open an issue.

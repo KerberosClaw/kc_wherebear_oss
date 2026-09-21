@@ -47,6 +47,7 @@ dev 全綠 → 已搬上線、prod 每天在用。
 - [x] MapKit 時間軸（停留段列表 + 地圖軌跡 + 行事曆選日期）
 - [x] 停留段演算法：初版 real-data spike 定案（隨 history 累積持續調、`confidence` 承接初期粗糙）
 - [x] iOS 單元測試（Swift Testing）：WBClient JWT `401→refresh→retry` / CLVisit 停留 outbox durability 回歸（`app/wherebear_app/wherebear_appTests/`）
+- [~] iPhone Duo 版面適配（2026-09-20）：七種視窗形狀、摺痕與鏡頭分區、旋轉、自適應日期卡片與多 App Split View 均已實作，**驗收僅到 Simulator 與純 Swift 幾何檢查**；實機 2026-10-23 才上市，尚未驗過。見[適配筆記](IPHONE_DUO.md)與[踩坑回顧](IPHONE_DUO_LESSONS.md)，歡迎有實機的人回報。
 
 ## Phase 3 — Google SSO（登入基建，小）
 

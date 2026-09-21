@@ -22,10 +22,108 @@ struct TimelineScreen: View {
     @State private var calMonth = Date()
     @State private var rangeFrom = Date()
     @State private var rangeTo = Date()
+    @State private var rangeMonth = Date()
+    private enum RangeEndpoint { case from, to }
+    @State private var rangeEndpoint: RangeEndpoint = .from
 
     private var selectedStay: Stay? { vm.todayStays.first { $0.id == selectedStayID } }
 
+    @Environment(\.horizontalSizeClass) private var sizeClass
+    @Environment(\.adaptiveControlRail) private var controlRail
+    @State private var listCollapsed = false
+    @State private var splitMap = false
+    @State private var listScrollOffset: CGFloat = 0
+    @State private var mapHeaderHeight: CGFloat = 0
+
     var body: some View {
+        GeometryReader { geo in
+            let layout = AdaptiveMapLayout(geo, regular: sizeClass == .regular,
+                                           collapsed: listCollapsed, controlRail: controlRail)
+            ZStack(alignment: .topLeading) {
+                mapPane(layout, topInset: geo.safeAreaInsets.top)
+                    .layoutFrame(layout.mapCanvas)
+                timelinePanel(layout, bottomInset: geo.safeAreaInsets.bottom)
+                    .layoutFrame(CGRect(x: layout.panel.minX, y: layout.panel.minY,
+                                        width: layout.panel.width,
+                                        height: layout.panel.height + (layout.split ? geo.safeAreaInsets.bottom : 0)))
+                    .opacity(layout.mode == .wide && listCollapsed ? 0 : 1)
+                    .allowsHitTesting(!(layout.mode == .wide && listCollapsed))
+                    .accessibilityHidden(layout.mode == .wide && listCollapsed)
+                if showImport && layout.split {
+                    modalScrim { showImport = false }
+                        .clipped()
+                        .layoutFrame(panelBackdrop(layout, insets: geo.safeAreaInsets))
+                        .zIndex(10)
+                    PhotoImportSheet(onImported: { _ in Task { await vm.reloadStays() } },
+                                     prefersColumns: layout.mode == .laptop,
+                                     onClose: { showImport = false })
+                        .background(layout.mode == .laptop ? Color.clear : BearTheme.sheet)
+                        .clipShape(RoundedRectangle(cornerRadius: 24))
+                        .padding(12)
+                        .layoutFrame(layout.panel)
+                        .zIndex(11)
+                }
+                ReservedInteractionShield(layout: layout).zIndex(20)
+                if showRange || showCalendar {
+                    if layout.split {
+                        modalScrim { closeModals() }
+                            .clipped()
+                            .layoutFrame(panelBackdrop(layout, insets: geo.safeAreaInsets))
+                            .zIndex(10)
+                    } else {
+                        modalScrim { closeModals() }.ignoresSafeArea().zIndex(10)
+                    }
+                    dateDialog(layout)
+                        .layoutFrame(layout.split ? layout.panel : layout.contentBounds)
+                        .zIndex(11)
+                }
+            }
+            .onChange(of: layout, initial: true) { previous, value in
+                splitMap = value.split
+                // An edge reservation changes foreground clearance, not the
+                // map viewport. Preserve the user's zoom and selected stay.
+                if didInitialFit && value.needsMapRefit(comparedTo: previous) {
+                    if let stay = selectedStay { select(stay) }
+                    else { applyFit(collapse: false) }
+                }
+                if value.divided { listCollapsed = false }
+            }
+        }
+        .background(BearTheme.sheet.ignoresSafeArea())
+        .sheet(isPresented: Binding(get: { showImport && !splitMap },
+                                    set: { showImport = $0 })) {
+            PhotoImportSheet(onImported: { _ in Task { await vm.reloadStays() } })
+        }
+        .sheet(item: $namingStay) { stay in
+            if let c = stay.coordinate {
+                // 已在某地標範圍內 → 開「編輯」那個地標（改名／拉大範圍），不再重建（避免重疊警告 + 重複地標）
+                let existing = landmarks.resolvePreview(c)
+                LandmarkFormSheet(coordinate: existing?.coordinate ?? c,
+                                  suggestedName: (stay.isLowConfidence || stay.name == "未命名地點") ? "" : stay.name,
+                                  editing: existing,
+                                  onSaved: { _ in reapplyAliases() },   // 樂觀更新：畫面先跟上
+                                  // 真的落地之後才做人為指定 —— 要拿 server id，也要確保
+                                  // 它跑在自動重判之前（否則感測器可能先定案，人講的話就輸了）
+                                  onPersisted: { saved in assignNamedStay(stay, to: saved) })
+            }
+        }
+        .task {
+            reporter.primeLocation()             // seed 即時位置 → 空狀態熊掌能置中回正北
+            await vm.reloadStays()               // 進頁：依 VM 目前選擇載入（不強制今天）
+            if !didInitialFit { didInitialFit = true; applyFit(collapse: false) } // 初次框景（有最小縮放，不爆大）
+        }
+        .onChange(of: reporter.lastReportAt) { Task { await vm.reloadStays() } }   // B4：回報寫入即刷新軌跡線/停留（邊看邊長、免切頁）；用本地 lastReportAt 信號、非 Realtime
+    }
+
+    private var dateChips: some View {
+        DateChips(items: ["今天", "選日期"],
+                  selected: .constant(vm.selectedDays.isEmpty ? 0 : 1), onTap: onDateChipTap)
+            .popover(isPresented: $showDateOptions) { optionsPopover }
+    }
+
+    private func toggleList() { withAnimation { listCollapsed.toggle() } }
+
+    private func mapPane(_ layout: AdaptiveMapLayout, topInset: CGFloat) -> some View {
         ZStack {
             Map(position: $camera) {
                 let coords = vm.todayStays.compactMap(\.coordinate)
@@ -50,110 +148,155 @@ struct TimelineScreen: View {
             }
             .mapControls { }   // 隱藏系統羅盤（轉向時不再冒出、也不會被面板遮）
             .mapStyle(.standard(elevation: .flat, pointsOfInterest: .excludingAll))
-            .ignoresSafeArea()
+            .ignoresSafeArea(edges: layout.split ? [] : .all)
 
-            // 頂部：熊掌 fit 鈕（左）＋日期 chips（右）＋選中點 callout
+
             VStack(spacing: 8) {
-                HStack(alignment: .top) {
-                    fitButton
-                    Spacer()
-                    DateChips(items: ["今天", "選日期"],
-                              selected: .constant(vm.selectedDays.isEmpty ? 0 : 1),
-                              onTap: onDateChipTap)
-                        .padding(.bottom, 10)   // 錨區往下擴 → popover 箭頭離 capsule 遠一點
-                        .popover(isPresented: $showDateOptions) { optionsPopover }   // 貼齊 chip 冒出（A）
-                }
-                .padding(.horizontal, 14)
-                .padding(.top, 6)
-                if let sel = selectedStay { calloutCard(sel) }
-                Spacer()
-            }
-
-            if vm.todayStays.isEmpty {
-                EmptyStateBear(title: vm.isRange ? "這段期間沒有足跡" : "這一天沒有足跡",
-                               message: "開著回報、或從相簿匯入，就會有紀錄。",
-                               actionTitle: "相簿匯入",
-                               action: { showImport = true })
-                    .padding(.horizontal, 44)
-            } else {
-                CollapsibleSheet(detent: $detent,
-                                 title: sheetTitle,
-                                 subtitle: sheetSubtitle,
-                                 fullTopFraction: selectedStay != nil ? 0.22 : 0.15) { // 有氣泡→貼氣泡下；無→貼上方按鈕下（#1）
-                    importButton
-                } content: {
-                    VStack(spacing: 0) {
-                        if vm.isRange {
-                            ForEach(dayGroups, id: \.day) { group in
-                                if let yh = group.yearHeader {   // 跨年時才顯示年份小標
-                                    Text(yh)
-                                        .font(.system(size: 13, weight: .heavy))
-                                        .foregroundStyle(BearTheme.cream.opacity(0.4))
-                                        .frame(maxWidth: .infinity, alignment: .leading)
-                                        .padding(.horizontal, 4).padding(.top, 14)
-                                }
-                                Text(dayHeaderText(group.day))   // 「7/2 週四」
-                                    .font(.system(size: 12.5, weight: .bold))
-                                    .foregroundStyle(BearTheme.honeyLight.opacity(0.9))
-                                    .frame(maxWidth: .infinity, alignment: .leading)
-                                    .padding(.horizontal, 4).padding(.top, 10).padding(.bottom, 2)
-                                ForEach(Array(group.stays.enumerated()), id: \.element.id) { i, stay in
-                                    row(stay, isLast: i == group.stays.count - 1)
-                                }
-                            }
-                        } else {
-                            ForEach(Array(vm.todayStays.enumerated()), id: \.element.id) { i, stay in
-                                row(stay, isLast: i == vm.todayStays.count - 1)
+                VStack(spacing: 8) {
+                    HStack(spacing: 8) {
+                        if layout.controlsOnTrailingEdge { Spacer(minLength: 0) }
+                        if layout.mode == .wide && listCollapsed {
+                            Button(action: toggleList) { Label("時間軸", systemImage: "sidebar.left") }
+                                .buttonStyle(.borderedProminent)
+                            fitButton
+                        } else if !layout.split {
+                            if layout.compactOverlay || sizeClass == .regular {
+                                dateToolbar
+                            } else {
+                                fitButton
+                                Spacer()
+                                dateChips
                             }
                         }
+                        if !layout.controlsOnTrailingEdge { Spacer(minLength: 0) }
                     }
-                    .padding(.top, 2)
+                    .padding(.horizontal, 14)
+                    .padding(.leading, max(0, layout.map.minX - layout.mapCanvas.minX))
+                    .padding(.top, layout.split ? 16 : layout.topInset)
+                    .offset(y: !layout.split && sizeClass == .regular
+                            ? -max(0, topInset - 12) : 0)
+                    if let sel = selectedStay { calloutCard(sel) }
                 }
+                .onGeometryChange(for: CGFloat.self) { proxy in
+                    proxy.size.height
+                } action: { height in
+                    mapHeaderHeight = height
+                }
+                Spacer()
             }
-
-            // 選日期置中對話框：遮罩只淡入（不縮放 → 整片同步、不會中間先上下慢），卡片才 pop
-            if showRange {
-                modalScrim { closeModals() }.transition(.opacity).zIndex(10)
-                rangeCard.padding(.horizontal, 30)
-                    .transition(.scale(scale: 0.92).combined(with: .opacity)).zIndex(11)
-            }
-            if showCalendar {
-                modalScrim { closeModals() }.transition(.opacity).zIndex(10)
-                calendarCard.padding(.horizontal, 30)
-                    .transition(.scale(scale: 0.92).combined(with: .opacity)).zIndex(11)
-            }
+            .padding(.leading, layout.split ? 0 : layout.contentBounds.minX)
+            .padding(.trailing, layout.split ? 0 : layout.bounds.maxX - layout.contentBounds.maxX)
+            .padding(.top, layout.split ? 0 : layout.contentBounds.minY)
+            .padding(.bottom, layout.split ? 0 : layout.bounds.maxY - layout.contentBounds.maxY)
+            if vm.todayStays.isEmpty && !layout.split { emptyState.padding(.horizontal, 32) }
         }
-        .background(BearTheme.bg)
-        .sheet(isPresented: $showImport) {
-            PhotoImportSheet(onImported: { _ in Task { await vm.reloadStays() } })
-        }
-        .sheet(item: $namingStay) { stay in
-            if let c = stay.coordinate {
-                // 已在某地標範圍內 → 開「編輯」那個地標（改名／拉大範圍），不再重建（避免重疊警告 + 重複地標）
-                let existing = landmarks.resolvePreview(c)
-                LandmarkFormSheet(coordinate: existing?.coordinate ?? c,
-                                  suggestedName: (stay.isLowConfidence || stay.name == "未命名地點") ? "" : stay.name,
-                                  editing: existing,
-                                  onSaved: { _ in reapplyAliases() },   // 樂觀更新：畫面先跟上
-                                  // 真的落地之後才做人為指定 —— 要拿 server id，也要確保
-                                  // 它跑在自動重判之前（否則感測器可能先定案，人講的話就輸了）
-                                  onPersisted: { saved in assignNamedStay(stay, to: saved) })
-            }
-        }
-        .task {
-            reporter.primeLocation()             // seed 即時位置 → 空狀態熊掌能置中回正北
-            await vm.reloadStays()               // 進頁：依 VM 目前選擇載入（不強制今天）
-            if !didInitialFit { didInitialFit = true; applyFit(collapse: false) } // 初次框景（有最小縮放，不爆大）
-        }
-        .onChange(of: reporter.lastReportAt) { Task { await vm.reloadStays() } }   // B4：回報寫入即刷新軌跡線/停留（邊看邊長、免切頁）；用本地 lastReportAt 信號、非 Realtime
     }
 
+    private var emptyState: some View {
+        EmptyStateBear(title: vm.isRange ? "這段期間沒有足跡" : "這一天沒有足跡",
+                       message: "開著回報、或從相簿匯入，就會有紀錄。",
+                       actionTitle: "相簿匯入", action: { showImport = true })
+    }
+
+    @ViewBuilder private func timelinePanel(_ layout: AdaptiveMapLayout, bottomInset: CGFloat) -> some View {
+        if layout.split {
+            VStack(alignment: .leading, spacing: 12) {
+                if layout.mode == .wide {
+                    HStack(spacing: 8) {
+                        ProfileMenu()
+                        dateChips
+                        Spacer(minLength: 0)
+                        Button(action: toggleList) { Image(systemName: "sidebar.left") }
+                            .accessibilityLabel("收合時間軸")
+                            .frame(width: 44, height: 44)
+                    }
+                    HStack(spacing: 8) {
+                        fitButton
+                        importIconButton
+                    }
+                } else {
+                    ViewThatFits(in: .horizontal) {
+                        HStack(spacing: 8) {
+                            if layout.mode != .laptop { ProfileMenu() }
+                            dateToolbar
+                        }
+                        VStack(alignment: .leading, spacing: 8) {
+                            HStack(spacing: 8) {
+                                if layout.mode != .laptop { ProfileMenu() }
+                                dateChips
+                            }
+                            HStack(spacing: 8) { fitButton; importIconButton }
+                        }
+                    }
+                }
+                panelHeading
+                if vm.todayStays.isEmpty {
+                    ScrollView { emptyState }
+                } else {
+                    ScrollView { stayRows(compact: layout.mode == .wide).padding(.bottom, max(12, bottomInset)) }
+                        .modifier(RememberTimelineScroll(offset: $listScrollOffset))
+                }
+            }
+            .padding(.horizontal, 18)
+            .padding(.top, 18)
+            .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+            .background(BearTheme.sheet)
+            .clipped()
+        } else if !vm.todayStays.isEmpty {
+            CollapsibleSheet(detent: $detent, title: sheetTitle, subtitle: sheetSubtitle,
+                             fullTopFraction: selectedStay != nil ? 0.22 : 0.15,
+                             floating: layout.compactOverlay,
+                             minimumTop: layout.compactOverlay ? max(layout.topInset + 44, mapHeaderHeight) + 12 : 0,
+                             scrollOffset: $listScrollOffset) {
+                if !layout.compactOverlay && sizeClass != .regular { importButton }
+            } content: { stayRows(compact: layout.compactOverlay) }
+        }
+    }
+
+    private var panelHeading: some View {
+        VStack(alignment: .leading, spacing: 2) {
+            Text(sheetTitle).font(.headline).foregroundStyle(BearTheme.cream)
+            Text(sheetSubtitle).font(.caption).foregroundStyle(BearTheme.cream.opacity(0.55))
+        }
+    }
+
+    private func stayRows(compact: Bool) -> some View {
+        VStack(spacing: 0) {
+            if vm.isRange {
+                ForEach(dayGroups, id: \.day) { group in
+                    if let yh = group.yearHeader {   // 跨年時才顯示年份小標
+                        Text(yh)
+                            .font(.system(size: 13, weight: .heavy))
+                            .foregroundStyle(BearTheme.cream.opacity(0.4))
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                            .padding(.horizontal, 4).padding(.top, 14)
+                    }
+                    Text(dayHeaderText(group.day))   // 「7/2 週四」
+                        .font(.system(size: 12.5, weight: .bold))
+                        .foregroundStyle(BearTheme.honeyLight.opacity(0.9))
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .padding(.horizontal, 4).padding(.top, 10).padding(.bottom, 2)
+                    ForEach(Array(group.stays.enumerated()), id: \.element.id) { i, stay in
+                        row(stay, isLast: i == group.stays.count - 1, compact: compact)
+                    }
+                }
+            } else {
+                ForEach(Array(vm.todayStays.enumerated()), id: \.element.id) { i, stay in
+                    row(stay, isLast: i == vm.todayStays.count - 1, compact: compact)
+                }
+            }
+        }
+        .padding(.top, 2)
+        .scrollTargetLayout()
+    }
+
+
     // 一列 stay（帶全域編號 → 地圖點對得上；點列 zoom 到該點）
-    private func row(_ stay: Stay, isLast: Bool) -> some View {
+    private func row(_ stay: Stay, isLast: Bool, compact: Bool) -> some View {
         StayRow(stay: stay, index: globalIndex(stay), isLast: isLast,
                 onName: stay.coordinate != nil ? { namingStay = stay } : nil,   // 匯入點也可命名（#6）
                 isSelected: stay.id == selectedStayID,
-                onTap: { select(stay) })
+                onTap: { select(stay) }, compact: compact)
     }
 
     // 全域序號（在 vm.todayStays 的位置＋1）→ 地圖 marker 與列表共用同一編號
@@ -199,8 +342,15 @@ struct TimelineScreen: View {
         }
     }
 
-    // 停留門檻說明（比照列表次要字）；對齊 detect_stays min_dwell_s=600（見 docs/TUNABLES.md）
-    private var sheetSubtitle: String { "久留逾 10 分鐘才算停留（路過不計）" }
+    // 停留門檻說明（比照列表次要字）。
+    //
+    // 🔴 這裡刻意**不寫數字**。原本寫的是「久留逾 10 分鐘才算停留」，對齊 detect_stays 的
+    //    min_dwell_s=600 —— 但那個門檻只管用定位點聚出來的 live 段，**CLVisit 段完全不吃**
+    //    （prod 實測有 4～9 分鐘的 src=visit 段照樣顯示）。也就是說畫面承諾了一件它沒在做的事。
+    //
+    //    要對齊只有兩條路，而把門檻也套到 CLVisit 段上是錯的：那會讓一堆真實的短停留
+    //    （轉乘、買個東西）從時間軸消失 —— 拿好資料去遷就一句文案。所以改的是文案。
+    private var sheetSubtitle: String { "短暫經過可能不會留下紀錄" }
 
     // 面板標題：今天 / 某日「M/D」/ 多日「N 個」
     private var sheetTitle: String {
@@ -226,7 +376,7 @@ struct TimelineScreen: View {
         }
     }
 
-    // 熊掌 fit：先收面板（看整張圖、中心才不會被遮）
+    // 顯示全部足跡：先收面板（看整張圖、中心才不會被遮）
     private func fitCamera() { applyFit(collapse: true) }
 
     // 框景（初次進頁 / 換日期 collapse=false 不收面板；熊掌 collapse=true 收面板）
@@ -257,6 +407,7 @@ struct TimelineScreen: View {
 
     // 面板遮住地圖下半 → 把相機中心往「南」偏，讓目標落在可見的上半（#2/#5：體感不跑掉）
     private func coverage(for d: SheetDetent) -> Double {
+        if splitMap { return 0 }
         switch d {
         case .collapsed: return 0.10
         case .half:      return 0.27
@@ -311,18 +462,40 @@ struct TimelineScreen: View {
         return "\(m)/\(day) 週\(names[wd - 1])"
     }
 
+    private var dateToolbar: some View {
+        HStack(spacing: 8) {
+            dateChips
+            fitButton
+            importIconButton
+        }
+    }
+
     private var fitButton: some View {
         Button { fitCamera() } label: {
             Image(systemName: "pawprint.fill")
-                .font(.system(size: 21, weight: .bold))
+                .font(.system(size: 18, weight: .semibold))
                 .foregroundStyle(BearTheme.honeyLight)
-                .frame(width: 52, height: 52)   // 放大好按（#3）
-                .glassEffect(.regular.tint(BearTheme.surfaceHi.opacity(0.7)), in: Circle())
-                .overlay(Circle().strokeBorder(BearTheme.honeyLight.opacity(0.3), lineWidth: 1))
-                .shadow(color: .black.opacity(0.45), radius: 9, y: 3)
+                .frame(width: 44, height: 44)
+                .background(Circle().fill(BearTheme.surface))
+                .overlay(Circle().strokeBorder(BearTheme.honeyLight.opacity(0.35), lineWidth: 0.5))
         }
         .buttonStyle(.plain)
-        .contentShape(Circle())
+        .accessibilityLabel("顯示全部足跡")
+        .help("顯示全部足跡")
+    }
+
+    private var importIconButton: some View {
+        Button { showImport = true } label: {
+            Image(systemName: "camera")
+                .font(.system(size: 18, weight: .semibold))
+                .foregroundStyle(BearTheme.honeyLight)
+                .frame(width: 44, height: 44)
+                .background(Circle().fill(BearTheme.surface))
+                .overlay(Circle().strokeBorder(BearTheme.honeyLight.opacity(0.35), lineWidth: 0.5))
+        }
+        .buttonStyle(.plain)
+        .accessibilityLabel("相簿匯入")
+        .help("相簿匯入")
     }
 
     private var importButton: some View {
@@ -413,50 +586,94 @@ struct TimelineScreen: View {
         .buttonStyle(.plain)
     }
 
-    // 時間區間置中卡片
-    private var rangeCard: some View {
-        VStack(spacing: 16) {
-            Text("時間區間").font(.system(size: 18, weight: .heavy)).foregroundStyle(BearTheme.cream)
-            VStack(spacing: 8) {
-                DatePicker("從", selection: $rangeFrom, in: ...Date(), displayedComponents: .date)
-                DatePicker("到", selection: $rangeTo, in: ...Date(), displayedComponents: .date)
-            }
-            .environment(\.locale, Locale(identifier: "zh_TW"))
-            .tint(BearTheme.honeyLight)
-            .foregroundStyle(BearTheme.cream)
-            Text("選一段連續日期（上限約一個月）。").font(.system(size: 11.5)).foregroundStyle(BearTheme.cream.opacity(0.5))
-            HStack(spacing: 12) {
-                modalButton("取消", filled: false) { closeModals() }
-                modalButton("完成", filled: true) { applyRange() }
-            }
-        }
-        .padding(20)
-        .background(RoundedRectangle(cornerRadius: 24).fill(BearTheme.sheet))
-        .overlay(RoundedRectangle(cornerRadius: 24).strokeBorder(.white.opacity(0.08), lineWidth: 0.5))
-        .shadow(color: .black.opacity(0.5), radius: 24, y: 10)
+    // Background coverage includes the fold margin and screen edge;
+    // controls remain inside the smaller safe panel rectangle.
+    private func panelBackdrop(_ layout: AdaptiveMapLayout, insets: EdgeInsets) -> CGRect {
+        let top = layout.mode == .laptop ? (layout.division?.midY ?? layout.panel.minY) : -insets.top
+        let right = layout.mode == .book ? (layout.division?.midX ?? layout.panel.maxX) : layout.panel.maxX
+        return CGRect(x: -insets.leading, y: top,
+                      width: right + insets.leading,
+                      height: layout.bounds.maxY + insets.bottom - top)
     }
 
-    // 行事曆多選置中卡片（A+B：月曆＋已選 N 天＋快捷）
-    private var calendarCard: some View {
-        VStack(spacing: 12) {
-            BearCalendar(selected: $calSelected, recorded: calRecorded, month: $calMonth,
-                         onMonthChange: { Task { await loadCalRecorded() } })
+    private func dateDialog(_ layout: AdaptiveMapLayout) -> some View {
+        AdaptiveDateDialog(prefersColumns: layout.mode == .laptop,
+                           controlsAboveCalendar: showRange) {
+            if showRange {
+                BearCalendar(selected: .constant([keyOf(rangeEndpoint == .from ? rangeFrom : rangeTo)]),
+                             recorded: [], month: $rangeMonth, onMonthChange: {},
+                             onSelect: { date in
+                                 if rangeEndpoint == .from { rangeFrom = date }
+                                 else { rangeTo = date }
+                             })
+            } else {
+                BearCalendar(selected: $calSelected, recorded: calRecorded, month: $calMonth,
+                             onMonthChange: { Task { await loadCalRecorded() } })
+            }
+        } controls: { columns in
+            if showRange { rangeControls(columns: columns) }
+            else { calendarControls(columns: columns) }
+        } actions: {
             HStack(spacing: 8) {
+                modalButton("取消", filled: false) { closeModals() }
+                modalButton("完成", filled: true) {
+                    if showRange { applyRange() } else { applyCalendarSelection() }
+                }
+            }
+        }
+    }
+
+    private func rangeControls(columns: Bool) -> some View {
+        VStack(spacing: 12) {
+            Text("時間區間").font(.system(size: 18, weight: .heavy)).foregroundStyle(BearTheme.cream)
+            let fields = columns ? AnyLayout(VStackLayout(spacing: 8)) : AnyLayout(HStackLayout(spacing: 8))
+            fields {
+                rangeField("從", date: rangeFrom, endpoint: .from)
+                rangeField("到", date: rangeTo, endpoint: .to)
+            }
+            Text("選一段連續日期（上限約一個月）。")
+                .font(.system(size: 11.5)).foregroundStyle(BearTheme.cream.opacity(0.55))
+                .multilineTextAlignment(.center)
+                .fixedSize(horizontal: false, vertical: true)
+        }
+    }
+
+    private func rangeField(_ title: String, date: Date, endpoint: RangeEndpoint) -> some View {
+        let active = rangeEndpoint == endpoint
+        return Button {
+            rangeEndpoint = endpoint
+            rangeMonth = date
+        } label: {
+            VStack(alignment: .leading, spacing: 4) {
+                Text(title).font(.system(size: 12, weight: .semibold))
+                Text(keyOf(date).replacingOccurrences(of: "-", with: "/"))
+                    .font(.system(size: 14, weight: .bold)).monospacedDigit()
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .padding(.horizontal, 12).padding(.vertical, 10)
+            .foregroundStyle(active ? BearTheme.ink : BearTheme.cream)
+            .background(RoundedRectangle(cornerRadius: 14)
+                .fill(active ? BearTheme.honeyLight : .white.opacity(0.08)))
+        }
+        .buttonStyle(.plain)
+        .accessibilityLabel("\(title) \(keyOf(date))")
+        .accessibilityAddTraits(active ? .isSelected : [])
+    }
+
+    private func calendarControls(columns: Bool) -> some View {
+        VStack(alignment: columns ? .leading : .center, spacing: 10) {
+            if columns { Text("選日期").font(.headline).foregroundStyle(BearTheme.cream) }
+            let shortcuts = columns ? AnyLayout(VStackLayout(alignment: .leading, spacing: 8))
+                : AnyLayout(HStackLayout(spacing: 8))
+            shortcuts {
                 quickChip("最近 7 天") { quickSelectRecent(7) }
                 quickChip("本月") { quickSelectThisMonth() }
                 quickChip("清除") { calSelected = [] }
             }
             Text(calSelected.isEmpty ? "點日期多選（可不連續）。熊掌＝有足跡。" : "已選 \(calSelected.count) 天")
                 .font(.system(size: 11.5)).foregroundStyle(BearTheme.cream.opacity(0.55))
-            HStack(spacing: 12) {
-                modalButton("取消", filled: false) { closeModals() }
-                modalButton("完成", filled: true) { applyCalendarSelection() }
-            }
+                .fixedSize(horizontal: false, vertical: true)
         }
-        .padding(18)
-        .background(RoundedRectangle(cornerRadius: 24).fill(BearTheme.sheet))
-        .overlay(RoundedRectangle(cornerRadius: 24).strokeBorder(.white.opacity(0.08), lineWidth: 0.5))
-        .shadow(color: .black.opacity(0.5), radius: 24, y: 10)
     }
 
     private func modalButton(_ title: String, filled: Bool, action: @escaping () -> Void) -> some View {
@@ -527,7 +744,6 @@ struct TimelineScreen: View {
             Rectangle().fill(.ultraThinMaterial)
             Color.black.opacity(0.2)
         }
-        .ignoresSafeArea()
         .contentShape(Rectangle())
         .onTapGesture { onClose() }
     }
@@ -543,6 +759,8 @@ struct TimelineScreen: View {
     private func openRange() {
         rangeTo = Date()
         rangeFrom = tzCal.date(byAdding: .day, value: -6, to: Date()) ?? Date()
+        rangeEndpoint = .from
+        rangeMonth = rangeFrom
         withAnimation(.spring(response: 0.32, dampingFraction: 0.82)) { showRange = true }
     }
     private func applyRange() {

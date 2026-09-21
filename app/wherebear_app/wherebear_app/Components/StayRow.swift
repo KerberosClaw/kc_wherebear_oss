@@ -9,6 +9,7 @@ struct StayRow: View {
     var onName: (() -> Void)? = nil
     var isSelected: Bool = false
     var onTap: (() -> Void)? = nil
+    var compact = false
 
     var body: some View {
         HStack(alignment: .top, spacing: 13) {
@@ -34,12 +35,17 @@ struct StayRow: View {
                     // （"21:07 – 21:38"），寬度不同會讓左邊的名字拿到不一樣的空間 →
                     // **同一個長別名在兩列斷在不同位置**。固定寬度後每一列的名字欄一樣寬、斷行一致。
                     // 寬度取「已結束」那種格式在 12pt 下的實測寬度並留一點餘裕。
-                    Text(timeRangeText)
+                    if !compact {
+                        Text(timeRangeText)
                         .font(.system(size: 12))
                         .foregroundStyle(BearTheme.cream.opacity(0.5))
                         .lineLimit(1)
                         .fixedSize()
                         .frame(width: 84, alignment: .trailing)
+                    }
+                }
+                if compact {
+                    Text(timeRangeText).font(.caption).foregroundStyle(BearTheme.cream.opacity(0.5))
                 }
                 HStack(spacing: 8) {
                     Text(detailText)

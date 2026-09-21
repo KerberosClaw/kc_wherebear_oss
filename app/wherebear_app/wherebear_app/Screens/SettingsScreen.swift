@@ -9,6 +9,7 @@ struct SettingsScreen: View {
     @Environment(ApiKeyManager.self) private var keyManager
     @Environment(ProfileManager.self) private var profile
     @Environment(LandmarkManager.self) private var landmarks
+    @Environment(\.adaptiveControlRail) private var controlRail
     @State private var avatarItem: PhotosPickerItem? = nil
     @State private var cropItem: CropItem? = nil
     @State private var editingName = false
@@ -125,7 +126,9 @@ struct SettingsScreen: View {
                         .textSelection(.enabled)
                 }
                 .padding(16)
-                .padding(.bottom, 100)
+                // A side rail already reserves horizontal space; it needs no
+                // extra bottom tab-bar clearance in the scroll content.
+                .padding(.bottom, controlRail == nil ? 100 : 0)
             }
             .background(BearTheme.bg)
             .toolbar(.hidden, for: .navigationBar)
