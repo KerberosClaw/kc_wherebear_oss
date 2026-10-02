@@ -1,0 +1,6 @@
+<resources>
+    <string name="app_name">熊熊在哪裡</string>
+    <string name="reporting_channel_name">位置回報</string>
+    <string name="reporting_notification_title">熊熊正在回報位置</string>
+    <string name="reporting_notification_text">低頻率、只送到你自己的後端。</string>
+</resources>
